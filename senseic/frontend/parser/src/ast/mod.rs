@@ -5,7 +5,7 @@ use sensei_core::Span;
 
 use crate::{
     StrId,
-    cst::{NodeIdx, NodeKind, NodeView},
+    cst::{NodeKind, NodeView},
     lexer::TokenIdx,
 };
 
@@ -82,40 +82,45 @@ impl<'cst> ConstDecl<'cst> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ImportKind {
-    As(StrId),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSuffix {
+    As(Option<StrId>),
     All,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Import<'cst> {
-    pub root: StrId,
-    pub next_path_node: Option<NodeIdx>,
-    pub kind: Option<ImportKind>,
+    path_node: NodeView<'cst>,
+    pub suffix: ImportSuffix,
     view: NodeView<'cst>,
 }
 
 impl<'cst> Import<'cst> {
     fn new(view: NodeView<'cst>) -> Option<Self> {
-        let (path_node, kind) = match view.kind() {
+        let (path_node, suffix) = match view.kind() {
             NodeKind::ImportAsDecl => {
                 let mut children = view.children();
                 let path = children.next()?;
                 let as_name = children.next()?.kind().as_ident()?;
-                (path, Some(ImportKind::As(as_name)))
+                (path, ImportSuffix::As(Some(as_name)))
             }
-            NodeKind::ImportDecl { glob } => (view, glob.then_some(ImportKind::All)),
+            NodeKind::ImportDecl { glob: false } => (view, ImportSuffix::As(None)),
+            NodeKind::ImportDecl { glob: true } => (view, ImportSuffix::All),
             _ => return None,
         };
-        let mut path_elements = path_node.children();
-        let root = path_elements.next()?.kind().as_ident()?;
-        let next_path_node = path_elements.next().map(NodeView::idx);
-        Some(Self { root, next_path_node, kind, view })
+        Some(Self { path_node, suffix, view })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
         self.view
+    }
+
+    pub fn collect_path_segments(&self, buf: &mut Vec<StrId>) {
+        for child in self.path_node.children() {
+            if let Some(ident) = child.ident() {
+                buf.push(ident);
+            }
+        }
     }
 }
 

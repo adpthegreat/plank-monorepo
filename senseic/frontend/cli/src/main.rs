@@ -2,13 +2,17 @@ use clap::Parser;
 use sensei_hir::{BigNumInterner, display::DisplayHir, lower};
 use sensei_mir::display::DisplayMir;
 use sensei_parser::{
+    SourceId,
     cst::display::DisplayCST,
     error_report::{ErrorCollector, LineIndex, format_error},
     interner::PlankInterner,
     lexer::Lexed,
-    parser::parse,
+    module::ModuleResolver,
+    project::parse_project,
+    source_fs::RealFs,
 };
 use sir_optimizations::{Optimizer, parse_passes_string};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "senseic", about = "Sensei compiler frontend")]
@@ -38,33 +42,71 @@ struct Args {
 
     #[arg(long = "already-ssa")]
     already_ssa: bool,
+
+    #[arg(long = "module-name")]
+    module_name: Option<String>,
+
+    #[arg(long = "module-root", requires = "module_name")]
+    module_root: Option<String>,
+
+    #[arg(long = "dep", value_parser = parse_dep)]
+    deps: Vec<(String, PathBuf)>,
+}
+
+fn parse_dep(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) =
+        s.split_once('=').ok_or_else(|| format!("expected format name=path, got '{s}'"))?;
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 fn main() {
     let args = Args::parse();
-    let source = std::fs::read_to_string(&args.file_path).expect("Failed to read file");
-
-    let lexed = Lexed::lex(&source);
-    let mut collector = ErrorCollector::default();
     let mut interner = PlankInterner::default();
-    let cst = parse(&lexed, &mut interner, &mut collector);
+    let mut module_resolver = ModuleResolver::default();
+    if let Some(name) = &args.module_name {
+        let name_id = interner.intern(name);
+        let root = match &args.module_root {
+            Some(root) => PathBuf::from(root),
+            None => Path::new(&args.file_path)
+                .parent()
+                .expect("file path has no parent directory")
+                .to_path_buf(),
+        };
+        module_resolver.register(name_id, root);
+    }
+    for (name, path) in &args.deps {
+        let name_id = interner.intern(name);
+        module_resolver.register(name_id, path.clone());
+    }
+
+    let mut collector = ErrorCollector::default();
+    let project = parse_project(
+        Path::new(&args.file_path),
+        &module_resolver,
+        &mut interner,
+        &mut collector,
+        &RealFs,
+    );
 
     if args.show_cst {
-        let display = DisplayCST::new(&cst, &source, &lexed).show_line(args.show_lines);
+        let entry = &project.sources[SourceId::ROOT];
+        let lexed = Lexed::lex(&entry.content);
+        let display =
+            DisplayCST::new(&entry.cst, &entry.content, &lexed).show_line(args.show_lines);
         println!("{}", display);
     }
 
     if !collector.errors.is_empty() {
-        let line_index = LineIndex::new(&source);
-        for error in &collector.errors {
-            eprintln!("{}\n", format_error(error, &source, &line_index));
+        for (source_id, error) in &collector.errors {
+            let source = &project.sources[*source_id];
+            let line_index = LineIndex::new(&source.content);
+            eprintln!("{}\n", format_error(error, &source.content, &line_index));
         }
-
         std::process::exit(1);
     }
 
     let mut big_nums = BigNumInterner::new();
-    let hir = lower(&cst, &mut big_nums);
+    let hir = lower(&project, &mut big_nums);
 
     if args.show_hir {
         if args.show_mir {
