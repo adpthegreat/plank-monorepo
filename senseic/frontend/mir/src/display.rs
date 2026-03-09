@@ -21,6 +21,7 @@ impl<'a> DisplayMir<'a> {
             Type::MemoryPointer => write!(f, "memptr"),
             Type::Type => write!(f, "type"),
             Type::Function => write!(f, "function"),
+            Type::Never => write!(f, "never"),
             Type::Struct(info) => {
                 write!(f, "struct#{}", info.type_index.get())
             }
@@ -89,20 +90,13 @@ impl<'a> DisplayMir<'a> {
     ) -> fmt::Result {
         let pad = "    ".repeat(indent);
         match instr {
-            Instruction::Set { target: local, value: expr } => {
+            Instruction::Set { target: local, expr } => {
                 write!(f, "{pad}")?;
                 self.fmt_local(f, local)?;
                 write!(f, " : ")?;
                 self.fmt_type(f, self.mir.fn_locals[fn_id][local.idx()])?;
                 write!(f, " = ")?;
                 self.fmt_expr(f, expr)?;
-                writeln!(f)
-            }
-            Instruction::Assign { target, value } => {
-                write!(f, "{pad}")?;
-                self.fmt_local(f, target)?;
-                write!(f, " := ")?;
-                self.fmt_expr(f, value)?;
                 writeln!(f)
             }
             Instruction::Return(value) => {

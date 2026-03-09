@@ -1,5 +1,5 @@
 use hashbrown::{DefaultHashBuilder, HashTable, hash_table::Entry};
-use sensei_core::{Idx, IndexVec, list_of_lists::ListOfLists, newtype_index};
+use sensei_core::{DenseIndexSet, Idx, IndexVec, list_of_lists::ListOfLists, newtype_index};
 use sensei_parser::{StrId, cst, interner::PlankInterner};
 use std::hash::BuildHasher;
 
@@ -32,6 +32,7 @@ pub enum Type<'fields> {
     MemoryPointer,
     Type,
     Function,
+    Never,
     Struct(StructInfo<'fields>),
 }
 
@@ -44,6 +45,7 @@ pub struct TypeInterner {
 
 #[derive(Debug)]
 struct StructStorage {
+    comptime_only: DenseIndexSet<StructIdx>,
     struct_fields: ListOfLists<StructIdx, TypeId>,
     struct_field_names: ListOfLists<StructIdx, StrId>,
     index_to_struct: IndexVec<StructIdx, StructExtraInfo>,
@@ -57,8 +59,9 @@ impl TypeId {
     pub const MEMORY_POINTER: TypeId = TypeId::new(3);
     pub const TYPE: TypeId = TypeId::new(4);
     pub const FUNCTION: TypeId = TypeId::new(5);
+    pub const NEVER: TypeId = TypeId::new(6);
 
-    const LAST_FIXED_ID: TypeId = Self::FUNCTION;
+    const LAST_FIXED_ID: TypeId = Self::NEVER;
     const STRUCT_IDS_OFFSET: u32 = Self::LAST_FIXED_ID.const_get() + 1;
 
     pub fn resolve_primitive(name: StrId) -> Option<TypeId> {
@@ -69,6 +72,7 @@ impl TypeId {
             PlankInterner::MEMPTR_TYPE_NAME => Some(TypeId::MEMORY_POINTER),
             PlankInterner::TYPE_TYPE_NAME => Some(TypeId::TYPE),
             PlankInterner::FUNCTION_TYPE_NAME => Some(TypeId::FUNCTION),
+            PlankInterner::NEVER_TYPE_NAME => Some(TypeId::NEVER),
             _ => None,
         }
     }
@@ -81,7 +85,16 @@ impl TypeId {
             Type::MemoryPointer => Ok(Self::MEMORY_POINTER),
             Type::Type => Ok(Self::TYPE),
             Type::Function => Ok(Self::FUNCTION),
+            Type::Never => Ok(Self::NEVER),
             Type::Struct(r#struct) => Err(r#struct),
+        }
+    }
+
+    const fn comptime_only(self) -> Result<bool, StructIdx> {
+        match self {
+            Self::VOID | Self::U256 | Self::BOOL | Self::NEVER | Self::MEMORY_POINTER => Ok(false),
+            Self::TYPE | Self::FUNCTION => Ok(true),
+            _ => Err(StructIdx::new(self.const_get() - Self::STRUCT_IDS_OFFSET)),
         }
     }
 
@@ -93,12 +106,17 @@ impl TypeId {
             Self::MEMORY_POINTER => Ok(Type::MemoryPointer),
             Self::TYPE => Ok(Type::Type),
             Self::FUNCTION => Ok(Type::Function),
+            Self::NEVER => Ok(Type::Never),
             _ => Err(StructIdx::new(self.const_get() - Self::STRUCT_IDS_OFFSET)),
         }
     }
 
     pub const fn is_struct(self) -> bool {
         self.0.get() > Self::LAST_FIXED_ID.0.get()
+    }
+
+    pub fn is_assignable_to(self, target: TypeId) -> bool {
+        self == target || self == TypeId::NEVER
     }
 }
 
@@ -118,6 +136,7 @@ impl TypeInterner {
     pub fn new() -> Self {
         Self {
             storage: StructStorage {
+                comptime_only: DenseIndexSet::new(),
                 struct_fields: Default::default(),
                 struct_field_names: Default::default(),
                 index_to_struct: Default::default(),
@@ -130,6 +149,7 @@ impl TypeInterner {
     pub fn with_capacity(structs: usize, fields: usize) -> Self {
         Self {
             storage: StructStorage {
+                comptime_only: DenseIndexSet::with_capacity_in_bits(structs),
                 struct_fields: ListOfLists::with_capacities(structs, fields),
                 struct_field_names: ListOfLists::with_capacities(structs, fields),
                 index_to_struct: IndexVec::with_capacity(structs),
@@ -137,6 +157,10 @@ impl TypeInterner {
             },
             info_to_struct: HashTable::with_capacity(structs),
         }
+    }
+
+    pub fn comptime_only(&self, ty: TypeId) -> bool {
+        self.storage.comptime_only(ty)
     }
 
     pub fn intern(&mut self, ty: Type<'_>) -> TypeId {
@@ -160,6 +184,14 @@ impl TypeInterner {
                     source: r#struct.source,
                     type_index: r#struct.type_index,
                 });
+
+                for &ty in r#struct.field_types {
+                    if self.storage.comptime_only(ty) {
+                        self.storage.comptime_only.add(new_struct_idx);
+                        break;
+                    }
+                }
+
                 debug_assert_eq!(new_struct_idx, field_struct_idx);
                 debug_assert_eq!(new_struct_idx, name_struct_idx);
                 vacant.insert(new_struct_idx);
@@ -206,5 +238,13 @@ impl StructStorage {
 
     fn hash_struct_info(&self, r#struct: StructInfo) -> u64 {
         self.hasher.hash_one(r#struct)
+    }
+
+    pub fn comptime_only(&self, ty: TypeId) -> bool {
+        let struct_idx = match ty.comptime_only() {
+            Ok(comptime_only) => return comptime_only,
+            Err(struct_idx) => struct_idx,
+        };
+        self.comptime_only.contains(struct_idx)
     }
 }
