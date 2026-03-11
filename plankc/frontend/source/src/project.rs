@@ -1,19 +1,14 @@
-use crate::{
-    StrId, ast::TopLevelDef, cst::ConcreteSyntaxTree, diagnostics::DiagnosticsContext,
-    interner::PlankInterner, lexer::Lexed, module::ModuleResolver, parser::parse,
-    source_fs::SourceFs,
-};
+use crate::{module::ModuleResolver, source_fs::SourceFs};
 use hashbrown::HashMap;
-use plank_core::{Idx, IndexVec, list_of_lists::ListOfLists, newtype_index};
+use plank_core::{IndexVec, SourceId, list_of_lists::ListOfLists, newtype_index};
+use plank_parser::{
+    StrId, ast::TopLevelDef, cst::ConcreteSyntaxTree, diagnostics::DiagnosticsContext,
+    interner::PlankInterner, lexer::Lexed, parser::parse,
+};
 use std::path::{Path, PathBuf};
 
 newtype_index! {
     pub struct ImportIdx;
-    pub struct SourceId;
-}
-
-impl SourceId {
-    pub const ROOT: SourceId = SourceId::ZERO;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +27,7 @@ pub struct FileImport {
 pub struct Source {
     pub path: PathBuf,
     pub content: String,
+    pub lexed: Lexed,
     pub cst: ConcreteSyntaxTree,
 }
 
@@ -48,7 +44,7 @@ struct ProjectParser<'a, D: DiagnosticsContext, F: SourceFs> {
     module_resolver: &'a ModuleResolver,
 
     // Need `cst` borrowed for the duration of the loop, so we use `None` until we can set it.
-    sources: IndexVec<SourceId, (PathBuf, String, Option<ConcreteSyntaxTree>)>,
+    sources: IndexVec<SourceId, (PathBuf, String, Lexed, Option<ConcreteSyntaxTree>)>,
     file_imports: ListOfLists<SourceId, Option<FileImport>>,
     path_to_source: HashMap<PathBuf, SourceId>,
 
@@ -60,11 +56,12 @@ impl<D: DiagnosticsContext, F: SourceFs> ProjectParser<'_, D, F> {
     fn parse_source(&mut self, path: PathBuf) -> SourceId {
         let content = self.fs.read_to_string(&path).expect("failed to read source file");
         let source_id = self.sources.next_idx();
-        let cst = parse(&Lexed::lex(&content), self.interner, self.diagnostics, source_id);
+        let lexed = Lexed::lex(&content);
+        let cst = parse(&content, &lexed, self.interner, self.diagnostics, source_id);
         let prev = self.path_to_source.insert(path.clone(), source_id);
         assert!(prev.is_none());
 
-        assert_eq!(self.sources.push((path, content, None)), source_id);
+        assert_eq!(self.sources.push((path, content, lexed, None)), source_id);
         let file = cst.as_file();
 
         assert_eq!(
@@ -107,7 +104,7 @@ impl<D: DiagnosticsContext, F: SourceFs> ProjectParser<'_, D, F> {
             assert!(prev.is_none());
         }
 
-        let prev = self.sources[source_id].2.replace(cst);
+        let prev = self.sources[source_id].3.replace(cst);
         assert!(prev.is_none());
 
         source_id
@@ -145,9 +142,10 @@ pub fn parse_project(
             .sources
             .raw
             .into_iter()
-            .map(|(path, content, cst)| Source {
+            .map(|(path, content, lexed, cst)| Source {
                 path,
                 content,
+                lexed,
                 cst: cst.expect("not set in `parse_source`"),
             })
             .collect(),

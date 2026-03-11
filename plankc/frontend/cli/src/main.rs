@@ -7,10 +7,8 @@ use plank_parser::{
     error_report::{ErrorCollector, LineIndex, format_error},
     interner::PlankInterner,
     lexer::Lexed,
-    module::ModuleResolver,
-    project::parse_project,
-    source_fs::RealFs,
 };
+use plank_source::{ModuleResolver, parse_project, source_fs::RealFs};
 use sir_optimizations::{Optimizer, parse_passes_string};
 use std::path::{Path, PathBuf};
 
@@ -106,7 +104,8 @@ fn main() {
     }
 
     let mut big_nums = BigNumInterner::new();
-    let hir = lower(&project, &mut big_nums);
+    let mut collector = plank_diagnostics::SimpleCollector::default();
+    let hir = lower(&project, &mut big_nums, &mut collector);
 
     if args.show_hir {
         if args.show_mir {

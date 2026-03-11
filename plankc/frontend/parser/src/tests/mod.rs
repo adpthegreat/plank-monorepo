@@ -9,7 +9,6 @@ use crate::{
 use plank_test_utils::{dedent, dedent_preserve_indent};
 
 mod errorless;
-mod project;
 mod resiliency;
 
 fn parse_single_source(
@@ -18,7 +17,7 @@ fn parse_single_source(
 ) -> (ErrorCollector, crate::cst::ConcreteSyntaxTree) {
     let lexed = Lexed::lex(source);
     let mut collector = ErrorCollector::default();
-    let cst = parse(&lexed, interner, &mut collector, SourceId::ROOT);
+    let cst = parse(source, &lexed, interner, &mut collector, SourceId::ROOT);
     (collector, cst)
 }
 

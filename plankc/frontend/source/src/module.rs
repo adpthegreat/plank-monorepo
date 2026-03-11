@@ -1,14 +1,15 @@
-use crate::{
-    FILE_EXTENSION, StrId,
+use crate::{FILE_EXTENSION, project::ImportKind};
+use hashbrown::HashMap;
+use plank_parser::{
+    StrId,
     ast::{Import, ImportSuffix},
     interner::PlankInterner,
-    project::ImportKind,
 };
-use hashbrown::HashMap;
 use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct ModuleResolver {
+    /// Maps between module name and its path.
     modules: HashMap<StrId, PathBuf>,
 }
 
