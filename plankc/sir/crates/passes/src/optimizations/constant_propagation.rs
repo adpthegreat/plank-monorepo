@@ -1,41 +1,47 @@
+use crate::analyses::{AnalysesMask, DefUse, UseKind};
 use alloy_primitives::{I256, U256, U512};
-use sir_analyses::{DefUse, UseKind, compute_def_use, compute_predecessors};
+
+use crate::{AnalysesStore, Pass};
 use sir_data::{operation::*, *};
 use std::cmp::{Ordering, PartialOrd};
 
-pub struct SCCPAnalysis {
+#[derive(Default)]
+#[allow(clippy::upper_case_acronyms)]
+pub struct SCCP {
     lattice: IndexVec<LocalId, LatticeValue>,
-    pub reachable: DenseIndexSet<BasicBlockId>,
     cfg_worklist: Vec<BasicBlockId>,
     values_worklist: Vec<LocalId>,
-    predecessors: IndexVec<BasicBlockId, Vec<BasicBlockId>>,
 }
 
-impl SCCPAnalysis {
-    pub fn new() -> Self {
-        Self {
-            lattice: IndexVec::new(),
-            reachable: DenseIndexSet::new(),
-            cfg_worklist: Vec::new(),
-            values_worklist: Vec::new(),
-            predecessors: IndexVec::new(),
-        }
+impl Pass for SCCP {
+    fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        let uses = store.def_use(program);
+        let mut reachable = store.sccp_reachable.get_mut_maybe_invalid();
+        self.analysis(program, &uses, &mut reachable);
+        self.apply(program, &reachable);
+        drop(reachable);
+        store.sccp_reachable.mark_valid();
     }
 
-    pub fn reset(&mut self, program: &EthIRProgram) {
+    fn preserves(&self) -> AnalysesMask {
+        AnalysesMask::SccpReachable
+    }
+}
+
+impl SCCP {
+    fn reset(&mut self, program: &EthIRProgram, reachable: &mut DenseIndexSet<BasicBlockId>) {
         self.lattice.clear();
         self.lattice.resize(program.next_free_local_id.idx(), LatticeValue::Unknown);
-        self.reachable.clear();
+        reachable.clear();
         self.cfg_worklist.clear();
         self.values_worklist.clear();
-        compute_predecessors(program, &mut self.predecessors);
-        self.init_state(program);
+        self.init_state(program, reachable);
     }
 
-    fn init_state(&mut self, program: &EthIRProgram) {
+    fn init_state(&mut self, program: &EthIRProgram, reachable: &mut DenseIndexSet<BasicBlockId>) {
         for func in program.functions_iter() {
             let entry_id = func.entry().id();
-            self.reachable.add(entry_id);
+            reachable.add(entry_id);
             self.cfg_worklist.push(entry_id);
             for &input in func.entry().inputs() {
                 self.lattice[input] = LatticeValue::Overdefined;
@@ -43,26 +49,25 @@ impl SCCPAnalysis {
         }
     }
 
-    pub fn analysis(&mut self, program: &EthIRProgram, uses: &mut DefUse) {
-        self.reset(program);
-        compute_def_use(program, uses);
+    fn analysis(
+        &mut self,
+        program: &EthIRProgram,
+        defuse: &DefUse,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
+    ) {
+        self.reset(program, reachable);
         while let Some(bb_id) = self.cfg_worklist.pop() {
-            self.process_block(program, bb_id, uses);
+            self.process_block(program, bb_id, defuse, reachable);
         }
     }
 
-    pub fn apply(&self, program: &mut EthIRProgram) {
+    fn apply(&self, program: &mut EthIRProgram, reachable: &DenseIndexSet<BasicBlockId>) {
         for bb_id in program.basic_blocks.iter_idx() {
-            if self.reachable.contains(bb_id) {
+            if reachable.contains(bb_id) {
                 self.rewrite_constants(program, bb_id);
                 self.simplify_control(program, bb_id);
             }
         }
-    }
-
-    #[cfg(test)]
-    fn get_lattice(&self) -> &IndexVec<LocalId, LatticeValue> {
-        &self.lattice
     }
 
     fn rewrite_constants(&self, program: &mut EthIRProgram, bb_id: BasicBlockId) {
@@ -140,10 +145,15 @@ impl SCCPAnalysis {
         }
     }
 
-    fn process_control(&mut self, program: &EthIRProgram, bb_id: BasicBlockId) {
+    fn process_control(
+        &mut self,
+        program: &EthIRProgram,
+        bb_id: BasicBlockId,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
+    ) {
         for succ in program.block(bb_id).successors() {
             if self.is_edge_reachable(program, bb_id, succ) {
-                self.mark_reachable(program, bb_id, succ);
+                self.mark_reachable(program, bb_id, succ, reachable);
             }
         }
     }
@@ -194,13 +204,18 @@ impl SCCPAnalysis {
         }
     }
 
-    fn process_values(&mut self, program: &EthIRProgram, uses: &DefUse) {
+    fn process_values(
+        &mut self,
+        program: &EthIRProgram,
+        defuse: &DefUse,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
+    ) {
         while let Some(value) = self.values_worklist.pop() {
-            for use_loc in &uses[value] {
-                if !self.reachable.contains(use_loc.block_id) {
+            for use_loc in defuse.uses_of(value) {
+                if !reachable.contains(use_loc.block_id) {
                     continue;
                 }
-                self.process_use(program, use_loc.block_id, use_loc.kind, value);
+                self.process_use(program, use_loc.block_id, use_loc.kind, value, reachable);
             }
         }
     }
@@ -211,6 +226,7 @@ impl SCCPAnalysis {
         block_id: BasicBlockId,
         kind: UseKind,
         value: LocalId,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
     ) {
         match kind {
             UseKind::Operation(op_id) => {
@@ -232,7 +248,7 @@ impl SCCPAnalysis {
                 }
             }
             UseKind::Control => {
-                self.process_control(program, block_id);
+                self.process_control(program, block_id, reachable);
             }
             UseKind::BlockOutput => {
                 let block = program.block(block_id);
@@ -251,15 +267,27 @@ impl SCCPAnalysis {
         }
     }
 
-    fn process_block(&mut self, program: &EthIRProgram, bb_id: BasicBlockId, uses: &DefUse) {
+    fn process_block(
+        &mut self,
+        program: &EthIRProgram,
+        bb_id: BasicBlockId,
+        defuse: &DefUse,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
+    ) {
         self.process_operations(program, bb_id);
-        self.process_control(program, bb_id);
-        self.process_values(program, uses);
+        self.process_control(program, bb_id, reachable);
+        self.process_values(program, defuse, reachable);
     }
 
-    fn mark_reachable(&mut self, program: &EthIRProgram, from: BasicBlockId, to: BasicBlockId) {
-        if !self.reachable.contains(to) {
-            self.reachable.add(to);
+    fn mark_reachable(
+        &mut self,
+        program: &EthIRProgram,
+        from: BasicBlockId,
+        to: BasicBlockId,
+        reachable: &mut DenseIndexSet<BasicBlockId>,
+    ) {
+        if !reachable.contains(to) {
+            reachable.add(to);
             self.cfg_worklist.push(to);
             self.flow_outputs_to(program, from, to);
         }
@@ -331,19 +359,16 @@ impl SCCPAnalysis {
                 let b = program.locals[*ins_start + 1];
                 let n = program.locals[*ins_start + 2];
 
-                self.const_u256(a).and_then(|va| self.const_u256(b).map(|vb| (va, vb))).and_then(
-                    |(va, vb)| {
-                        self.const_u256(n).map(|vn| {
-                            let result = if vn.is_zero() {
-                                U256::ZERO
-                            } else {
-                                let sum = U512::from(va) + U512::from(vb);
-                                U256::from(sum % U512::from(vn))
-                            };
-                            (*out, result)
-                        })
-                    },
-                )
+                let va = self.const_u256(a)?;
+                let vb = self.const_u256(b)?;
+                let vn = self.const_u256(n)?;
+                let result = if vn.is_zero() {
+                    U256::ZERO
+                } else {
+                    let sum = U512::from(va) + U512::from(vb);
+                    U256::from(sum % U512::from(vn))
+                };
+                Some((*out, result))
             }
             Operation::MulMod(AllocatedIns { ins_start, outs: [out] }) => {
                 let a = program.locals[*ins_start];
@@ -551,17 +576,26 @@ define_consts!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AnalysesStore, run_pass, run_pass_and_display};
     use sir_parser::{EmitConfig, parse_or_panic};
     use sir_test_utils::assert_trim_strings_eq_with_diff;
 
-    fn run_const_prop(source: &str) -> (String, IndexVec<LocalId, LatticeValue>) {
+    fn run_analysis(source: &str) -> (SCCP, DenseIndexSet<BasicBlockId>) {
+        let ir = parse_or_panic(source, EmitConfig::init_only());
+        let store = AnalysesStore::default();
+        let defuse = store.def_use(&ir);
+        let mut sccp = SCCP::default();
+        let mut reachable = DenseIndexSet::new();
+        sccp.analysis(&ir, &defuse, &mut reachable);
+        (sccp, reachable)
+    }
+
+    fn run_const_prop(source: &str) -> (String, SCCP) {
         let mut ir = parse_or_panic(source, EmitConfig::init_only());
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
-        let lattice = sccp.get_lattice().clone();
-        sccp.apply(&mut ir);
-        (sir_data::display_program(&ir), lattice)
+        let store = AnalysesStore::default();
+        let mut sccp = SCCP::default();
+        run_pass(&mut sccp, &mut ir, &store);
+        (sir_data::display_program(&ir), sccp)
     }
 
     #[test]
@@ -626,15 +660,15 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, lattice) = run_const_prop(input);
+        let (actual, sccp) = run_const_prop(input);
         assert_trim_strings_eq_with_diff(
             &actual,
             expected,
             "block inputs propagate only when predecessors agree",
         );
 
-        assert_eq!(lattice[LocalId::new(6)], LatticeValue::Overdefined);
-        assert_eq!(lattice[LocalId::new(8)], LatticeValue::Overdefined);
+        assert_eq!(sccp.lattice[LocalId::new(6)], LatticeValue::Overdefined);
+        assert_eq!(sccp.lattice[LocalId::new(8)], LatticeValue::Overdefined);
     }
 
     #[test]
@@ -669,7 +703,7 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, _) = run_const_prop(input);
+        let actual = run_pass_and_display::<SCCP>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "branch zero takes false");
     }
 
@@ -705,7 +739,7 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, _) = run_const_prop(input);
+        let actual = run_pass_and_display::<SCCP>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "branch nonzero takes true");
     }
 
@@ -748,7 +782,7 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, _) = run_const_prop(input);
+        let actual = run_pass_and_display::<SCCP>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "switch with folded condition");
     }
 
@@ -791,7 +825,7 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, _) = run_const_prop(input);
+        let actual = run_pass_and_display::<SCCP>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "switch no match takes default");
     }
 
@@ -841,15 +875,15 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, lattice) = run_const_prop(input);
+        let (actual, sccp) = run_const_prop(input);
         assert_trim_strings_eq_with_diff(
             &actual,
             expected,
             "internal function inputs remain overdefined and don't propagate constants incorrectly",
         );
 
-        assert_eq!(lattice[LocalId::new(0)], LatticeValue::Overdefined);
-        assert_eq!(lattice[LocalId::new(1)], LatticeValue::Overdefined);
+        assert_eq!(sccp.lattice[LocalId::new(0)], LatticeValue::Overdefined);
+        assert_eq!(sccp.lattice[LocalId::new(1)], LatticeValue::Overdefined);
     }
 
     #[test]
@@ -1004,7 +1038,7 @@ Basic Blocks:
     }
         "#;
 
-        let (actual, lattice) = run_const_prop(input);
+        let (actual, sccp) = run_const_prop(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "constant evaluation");
 
         let neg1 = U256::from_str_radix(
@@ -1028,18 +1062,18 @@ Basic Blocks:
         )
         .unwrap();
 
-        assert_eq!(lattice[LocalId::new(12)], LatticeValue::Const(int_min));
-        assert_eq!(lattice[LocalId::new(13)], LatticeValue::Const(int_max));
-        assert_eq!(lattice[LocalId::new(17)], LatticeValue::Const(neg2));
-        assert_eq!(lattice[LocalId::new(18)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(31)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(32)], LatticeValue::Const(int_min));
-        assert_eq!(lattice[LocalId::new(43)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(44)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(49)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(50)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(12)], LatticeValue::Const(int_min));
+        assert_eq!(sccp.lattice[LocalId::new(13)], LatticeValue::Const(int_max));
+        assert_eq!(sccp.lattice[LocalId::new(17)], LatticeValue::Const(neg2));
+        assert_eq!(sccp.lattice[LocalId::new(18)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(31)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(32)], LatticeValue::Const(int_min));
+        assert_eq!(sccp.lattice[LocalId::new(43)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(44)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(49)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(50)], LatticeValue::Const(neg1));
         assert_eq!(
-            lattice[LocalId::new(54)],
+            sccp.lattice[LocalId::new(54)],
             LatticeValue::Const(
                 U256::from_str_radix(
                     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff80",
@@ -1135,7 +1169,7 @@ Basic Blocks:
                 }
         "#;
 
-        let (_, lattice) = run_const_prop(input);
+        let (sccp, _) = run_analysis(input);
 
         let neg2 = U256::from_str_radix(
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe",
@@ -1158,56 +1192,56 @@ Basic Blocks:
         )
         .unwrap();
 
-        assert_eq!(lattice[LocalId::new(11)], LatticeValue::Const(neg2));
-        assert_eq!(lattice[LocalId::new(12)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(13)], LatticeValue::Const(neg2));
-        assert_eq!(lattice[LocalId::new(14)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(15)], LatticeValue::Const(neg2));
-        assert_eq!(lattice[LocalId::new(16)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(17)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(18)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(19)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(20)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(21)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(22)], LatticeValue::Const(U256::from(0xff)));
-        assert_eq!(lattice[LocalId::new(23)], LatticeValue::Const(int_min));
-        assert_eq!(lattice[LocalId::new(24)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(25)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(26)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(27)], LatticeValue::Const(U256::from(1) << 255));
-        assert_eq!(lattice[LocalId::new(28)], LatticeValue::Const(U256::ONE));
-        assert_eq!(lattice[LocalId::new(29)], LatticeValue::Const(U256::ONE));
-        assert_eq!(lattice[LocalId::new(30)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(31)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(32)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(33)], LatticeValue::Const(U256::from(0x100000001u64)));
-        assert_eq!(lattice[LocalId::new(34)], LatticeValue::Const(U256::from(1u128 << 64)));
-        assert_eq!(lattice[LocalId::new(35)], LatticeValue::Const(U256::from(1u128 << 64)));
-        assert_eq!(lattice[LocalId::new(36)], LatticeValue::Const(U256::from(1u64 << 32)));
-        assert_eq!(lattice[LocalId::new(37)], LatticeValue::Const(U256::from(1) << 128));
-        assert_eq!(lattice[LocalId::new(38)], LatticeValue::Const(U256::from(1) << 160));
+        assert_eq!(sccp.lattice[LocalId::new(11)], LatticeValue::Const(neg2));
+        assert_eq!(sccp.lattice[LocalId::new(12)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(13)], LatticeValue::Const(neg2));
+        assert_eq!(sccp.lattice[LocalId::new(14)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(15)], LatticeValue::Const(neg2));
+        assert_eq!(sccp.lattice[LocalId::new(16)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(17)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(18)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(19)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(20)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(21)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(22)], LatticeValue::Const(U256::from(0xff)));
+        assert_eq!(sccp.lattice[LocalId::new(23)], LatticeValue::Const(int_min));
+        assert_eq!(sccp.lattice[LocalId::new(24)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(25)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(26)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(27)], LatticeValue::Const(U256::from(1) << 255));
+        assert_eq!(sccp.lattice[LocalId::new(28)], LatticeValue::Const(U256::ONE));
+        assert_eq!(sccp.lattice[LocalId::new(29)], LatticeValue::Const(U256::ONE));
+        assert_eq!(sccp.lattice[LocalId::new(30)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(31)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(32)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(33)], LatticeValue::Const(U256::from(0x100000001u64)));
+        assert_eq!(sccp.lattice[LocalId::new(34)], LatticeValue::Const(U256::from(1u128 << 64)));
+        assert_eq!(sccp.lattice[LocalId::new(35)], LatticeValue::Const(U256::from(1u128 << 64)));
+        assert_eq!(sccp.lattice[LocalId::new(36)], LatticeValue::Const(U256::from(1u64 << 32)));
+        assert_eq!(sccp.lattice[LocalId::new(37)], LatticeValue::Const(U256::from(1) << 128));
+        assert_eq!(sccp.lattice[LocalId::new(38)], LatticeValue::Const(U256::from(1) << 160));
         assert_eq!(
-            lattice[LocalId::new(39)],
+            sccp.lattice[LocalId::new(39)],
             LatticeValue::Const((U256::from(1) << 128) - U256::from(1))
         );
-        assert_eq!(lattice[LocalId::new(40)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(40)], LatticeValue::Const(neg1));
         assert_eq!(
-            lattice[LocalId::new(41)],
+            sccp.lattice[LocalId::new(41)],
             LatticeValue::Const((U256::from(1) << 127) - U256::from(1))
         );
-        assert_eq!(lattice[LocalId::new(42)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(43)], LatticeValue::Const(neg1));
-        assert_eq!(lattice[LocalId::new(44)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(45)], LatticeValue::Const(int_max));
-        assert_eq!(lattice[LocalId::new(46)], LatticeValue::Const(U256::ONE));
-        assert_eq!(lattice[LocalId::new(47)], LatticeValue::Const(int_min));
-        assert_eq!(lattice[LocalId::new(48)], LatticeValue::Const(U256::from(3) << 254));
-        assert_eq!(lattice[LocalId::new(49)], LatticeValue::Const(U256::ONE));
-        assert_eq!(lattice[LocalId::new(50)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(51)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(52)], LatticeValue::Const(int_min));
-        assert_eq!(lattice[LocalId::new(53)], LatticeValue::Const(U256::ZERO));
-        assert_eq!(lattice[LocalId::new(54)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(42)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(43)], LatticeValue::Const(neg1));
+        assert_eq!(sccp.lattice[LocalId::new(44)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(45)], LatticeValue::Const(int_max));
+        assert_eq!(sccp.lattice[LocalId::new(46)], LatticeValue::Const(U256::ONE));
+        assert_eq!(sccp.lattice[LocalId::new(47)], LatticeValue::Const(int_min));
+        assert_eq!(sccp.lattice[LocalId::new(48)], LatticeValue::Const(U256::from(3) << 254));
+        assert_eq!(sccp.lattice[LocalId::new(49)], LatticeValue::Const(U256::ONE));
+        assert_eq!(sccp.lattice[LocalId::new(50)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(51)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(52)], LatticeValue::Const(int_min));
+        assert_eq!(sccp.lattice[LocalId::new(53)], LatticeValue::Const(U256::ZERO));
+        assert_eq!(sccp.lattice[LocalId::new(54)], LatticeValue::Const(U256::ZERO));
     }
 
     #[test]
@@ -1222,13 +1256,9 @@ Basic Blocks:
                 if_false { stop }                   // @2
         "#;
 
-        let ir = parse_or_panic(input, EmitConfig::init_only());
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
-
-        assert!(sccp.reachable.contains(BasicBlockId::new(1)));
-        assert!(!sccp.reachable.contains(BasicBlockId::new(2)));
+        let (_, reachable) = run_analysis(input);
+        assert!(reachable.contains(BasicBlockId::new(1)));
+        assert!(!reachable.contains(BasicBlockId::new(2)));
     }
 
     #[test]
@@ -1260,15 +1290,10 @@ Basic Blocks:
                 }
         "#;
 
-        let ir = parse_or_panic(input, EmitConfig::init_only());
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
-        let lattice = sccp.get_lattice();
-
-        assert_eq!(lattice[LocalId::new(5)], LatticeValue::EvmConst(EvmConstKind::Address));
-        assert_eq!(lattice[LocalId::new(6)], LatticeValue::Overdefined);
-        assert_eq!(lattice[LocalId::new(7)], LatticeValue::Overdefined);
+        let (sccp, _) = run_analysis(input);
+        assert_eq!(sccp.lattice[LocalId::new(5)], LatticeValue::EvmConst(EvmConstKind::Address));
+        assert_eq!(sccp.lattice[LocalId::new(6)], LatticeValue::Overdefined);
+        assert_eq!(sccp.lattice[LocalId::new(7)], LatticeValue::Overdefined);
     }
 
     #[test]
@@ -1335,25 +1360,20 @@ Basic Blocks:
     }
         "#;
 
-        let ir = parse_or_panic(input, EmitConfig::init_only());
+        let mut ir = parse_or_panic(input, EmitConfig::init_only());
         assert_trim_strings_eq_with_diff(
             &sir_data::display_program(&ir),
             expected_ir,
             "overdefined input makes both branch targets reachable",
         );
 
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
+        let store = AnalysesStore::default();
+        run_pass(&mut SCCP::default(), &mut ir, &store);
 
-        assert!(
-            sccp.reachable.contains(BasicBlockId::new(5)),
-            "true_target (@5) should be reachable"
-        );
-        assert!(
-            sccp.reachable.contains(BasicBlockId::new(6)),
-            "false_target (@6) should be reachable"
-        );
+        let reachable =
+            store.sccp_reachable.get_if_valid().expect("sccp did not populate reachable");
+        assert!(reachable.contains(BasicBlockId::new(5)), "true_target (@5) should be reachable");
+        assert!(reachable.contains(BasicBlockId::new(6)), "false_target (@6) should be reachable");
     }
 
     #[test]
@@ -1417,25 +1437,24 @@ Basic Blocks:
     }
         "#;
 
-        let ir = parse_or_panic(input, EmitConfig::init_only());
+        let mut ir = parse_or_panic(input, EmitConfig::init_only());
         assert_trim_strings_eq_with_diff(
             &sir_data::display_program(&ir),
             expected_ir,
             "block output use propagates overdefined to successor",
         );
 
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
-        let lattice = sccp.get_lattice();
+        let store = AnalysesStore::default();
+        let mut sccp = SCCP::default();
+        run_pass(&mut sccp, &mut ir, &store);
 
         assert_eq!(
-            lattice[LocalId::new(3)],
+            sccp.lattice[LocalId::new(3)],
             LatticeValue::Overdefined,
             "pass_through ($3) should be overdefined"
         );
         assert_eq!(
-            lattice[LocalId::new(4)],
+            sccp.lattice[LocalId::new(4)],
             LatticeValue::Overdefined,
             "final_val ($4) should be overdefined"
         );
@@ -1443,7 +1462,7 @@ Basic Blocks:
 
     #[test]
     fn test_reset_clears_state_and_reinitializes() {
-        let large_ir = parse_or_panic(
+        let mut large_ir = parse_or_panic(
             r#"
             fn init:
                 entry {
@@ -1456,7 +1475,7 @@ Basic Blocks:
             EmitConfig::init_only(),
         );
 
-        let small_ir = parse_or_panic(
+        let mut small_ir = parse_or_panic(
             r#"
             fn init:
                 entry {
@@ -1467,17 +1486,16 @@ Basic Blocks:
             EmitConfig::init_only(),
         );
 
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&large_ir, &mut uses);
-        assert_eq!(sccp.get_lattice()[LocalId::new(0)], LatticeValue::Const(U256::from(10)));
-        assert_eq!(sccp.get_lattice()[LocalId::new(1)], LatticeValue::Const(U256::from(20)));
-        assert_eq!(sccp.get_lattice()[LocalId::new(2)], LatticeValue::Const(U256::from(30)));
+        let store = AnalysesStore::default();
+        let mut sccp = SCCP::default();
+        run_pass(&mut sccp, &mut large_ir, &store);
+        assert_eq!(sccp.lattice[LocalId::new(0)], LatticeValue::Const(U256::from(10)));
+        assert_eq!(sccp.lattice[LocalId::new(1)], LatticeValue::Const(U256::from(20)));
+        assert_eq!(sccp.lattice[LocalId::new(2)], LatticeValue::Const(U256::from(30)));
 
-        sccp.analysis(&small_ir, &mut uses);
-        let lattice = sccp.get_lattice();
+        run_pass(&mut sccp, &mut small_ir, &store);
 
-        assert_eq!(lattice.len(), 1);
-        assert_eq!(lattice[LocalId::new(0)], LatticeValue::Const(U256::from(5)));
+        assert_eq!(sccp.lattice.len(), 1);
+        assert_eq!(sccp.lattice[LocalId::new(0)], LatticeValue::Const(U256::from(5)));
     }
 }

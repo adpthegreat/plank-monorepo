@@ -1,6 +1,6 @@
 use clap::Parser;
-use sir_optimizations::{Optimizer, parse_passes_string};
 use sir_parser::{EmitConfig, parse_or_panic};
+use sir_passes::{OPTIMIZE_HELP, PassManager, parse_optimizations_string};
 use std::{
     fs,
     io::{self, Read},
@@ -27,13 +27,7 @@ struct Cli {
     #[arg(long, default_value = "main")]
     main_name: String,
 
-    /// Optimization passes to run in order. Each character is a pass:
-    /// s = SCCP (constant propagation),
-    /// c = copy propagation,
-    /// u = unused operation elimination,
-    /// d = defragment.
-    /// Example: -O csud
-    #[arg(short = 'O', long = "optimize", value_parser = parse_passes_string)]
+    #[arg(short = 'O', long = "optimize", help = OPTIMIZE_HELP, value_parser = parse_optimizations_string)]
     optimize: Option<String>,
 }
 
@@ -71,9 +65,7 @@ fn main() {
     let mut program = parse_or_panic(&source, config);
 
     if let Some(passes) = cli.optimize {
-        let mut optimizer = Optimizer::new(program);
-        optimizer.run_passes(&passes);
-        program = optimizer.finish();
+        PassManager::new(&mut program).run_optimizations(&passes);
     }
 
     let mut bytecode = Vec::with_capacity(0x6000);

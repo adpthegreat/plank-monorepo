@@ -1,12 +1,37 @@
+use hashbrown::{HashMap, hash_map::Entry};
 use plank_core::span::IncIterable;
 use sir_data::{
-    BasicBlock, BasicBlockId, BlockView, Branch, Cases, CasesId, Control, ControlView, DataId,
+    BasicBlock, BasicBlockId, BlockView, Branch, Cases, Control, ControlView, DataId,
     DenseIndexSet, EthIRProgram, Function, FunctionId, Idx, LargeConstId, LocalId, LocalIdx,
     Operation, OperationIdx, Span, StaticAllocId, Switch, operation::OpVisitorMut,
 };
-use std::collections::{HashMap, hash_map::Entry};
 
+use crate::{AnalysesStore, Pass};
+
+#[derive(Default)]
 pub struct Defragmenter {
+    state: DefragmenterState,
+    scratch: EthIRProgram,
+}
+
+impl Pass for Defragmenter {
+    fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        self.state.clear();
+        self.scratch.clear();
+        let live_blocks = store.sccp_reachable.get_if_valid();
+        Rewriter {
+            state: &mut self.state,
+            src: program,
+            dst: &mut self.scratch,
+            live_blocks: live_blocks.as_deref(),
+        }
+        .rewrite();
+        std::mem::swap(program, &mut self.scratch);
+    }
+}
+
+#[derive(Default)]
+struct DefragmenterState {
     func_worklist: Vec<FunctionId>,
     block_worklist: Vec<BasicBlockId>,
     local_map: HashMap<LocalId, LocalId>,
@@ -15,31 +40,10 @@ pub struct Defragmenter {
     data_map: HashMap<DataId, DataId>,
     function_map: HashMap<FunctionId, FunctionId>,
     block_map: HashMap<BasicBlockId, BasicBlockId>,
-    cases_map: HashMap<CasesId, CasesId>,
 }
 
-impl Default for Defragmenter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Defragmenter {
-    pub fn new() -> Self {
-        Self {
-            func_worklist: Vec::new(),
-            block_worklist: Vec::new(),
-            local_map: HashMap::new(),
-            static_alloc_map: HashMap::new(),
-            large_const_map: HashMap::new(),
-            data_map: HashMap::new(),
-            function_map: HashMap::new(),
-            block_map: HashMap::new(),
-            cases_map: HashMap::new(),
-        }
-    }
-
-    pub fn clear(&mut self) {
+impl DefragmenterState {
+    fn clear(&mut self) {
         self.func_worklist.clear();
         self.block_worklist.clear();
         self.local_map.clear();
@@ -48,23 +52,11 @@ impl Defragmenter {
         self.data_map.clear();
         self.function_map.clear();
         self.block_map.clear();
-        self.cases_map.clear();
-    }
-
-    pub fn run(
-        &mut self,
-        src: &EthIRProgram,
-        dst: &mut EthIRProgram,
-        live_blocks: Option<&DenseIndexSet<BasicBlockId>>,
-    ) {
-        self.clear();
-        dst.clear();
-        Rewriter { state: self, src, dst, live_blocks }.rewrite();
     }
 }
 
 struct Rewriter<'a> {
-    state: &'a mut Defragmenter,
+    state: &'a mut DefragmenterState,
     src: &'a EthIRProgram,
     dst: &'a mut EthIRProgram,
     live_blocks: Option<&'a DenseIndexSet<BasicBlockId>>,
@@ -221,8 +213,6 @@ impl<'a> Rewriter<'a> {
         let block_map = &self.state.block_map;
         let local_map = &self.state.local_map;
         let large_const_map = &self.state.large_const_map;
-        let cases_map = &mut self.state.cases_map;
-
         for (old_id, new_id) in block_map {
             let new_control = match self.src.block(*old_id).control() {
                 ControlView::LastOpTerminates => Control::LastOpTerminates,
@@ -256,8 +246,6 @@ impl<'a> Rewriter<'a> {
                         targets_start_id: new_targets_start,
                         cases_count: old_cases.cases_count,
                     });
-                    let prev = cases_map.insert(switch.cases_id(), cases_id);
-                    debug_assert!(prev.is_none());
                     Control::Switch(Switch {
                         condition: local_map[&switch.condition()],
                         fallback: switch.fallback().map(|fb| block_map[&fb]),
@@ -378,10 +366,13 @@ impl<'a> OpVisitorMut<'_, ()> for &mut Rewriter<'a> {
 mod tests {
     use super::*;
     use crate::{
-        constant_propagation::SCCPAnalysis,
-        unused_operation_elimination::UnusedOperationElimination,
+        Legalizer,
+        analyses::AnalysesStore,
+        optimizations::{
+            constant_propagation::SCCP, unused_operation_elimination::UnusedOperationElimination,
+        },
+        run_pass,
     };
-    use sir_analyses::DefUse;
     use sir_parser::{EmitConfig, parse_or_panic};
     use sir_test_utils::assert_trim_strings_eq_with_diff;
 
@@ -427,13 +418,10 @@ mod tests {
         "#;
 
         let mut ir = parse_or_panic(input, EmitConfig::init_only());
+        let store = AnalysesStore::default();
 
-        let mut uses = DefUse::new();
-        let mut sccp = SCCPAnalysis::new();
-        sccp.analysis(&ir, &mut uses);
-        sccp.apply(&mut ir);
-
-        UnusedOperationElimination::new().run(&mut ir, &mut uses);
+        run_pass(&mut SCCP::default(), &mut ir, &store);
+        run_pass(&mut UnusedOperationElimination::default(), &mut ir, &store);
 
         let src_str = sir_data::display_program(&ir);
         let expected_src = r#"
@@ -483,11 +471,9 @@ data .0 0xcafebabe
         "#;
         assert_trim_strings_eq_with_diff(&src_str, expected_src, "src after sccp + unused elim");
 
-        let mut dst = EthIRProgram::default();
-        let mut defragmenter = Defragmenter::new();
-        defragmenter.run(&ir, &mut dst, Some(&sccp.reachable));
+        run_pass(&mut Defragmenter::default(), &mut ir, &store);
 
-        let dst_str = sir_data::display_program(&dst);
+        let dst_str = sir_data::display_program(&ir);
         let expected_dst = r#"
 Init: @0
 Functions:
@@ -514,7 +500,7 @@ Basic Blocks:
     }
         "#;
         assert_trim_strings_eq_with_diff(&dst_str, expected_dst, "dst after defragment");
-        assert_eq!(sir_analyses::legalize(&dst), Ok(()));
+        assert_eq!(Legalizer::default().run(&ir, &store), Ok(()));
     }
 
     #[test]
@@ -557,7 +543,7 @@ Basic Blocks:
             data dead_data 0x5678
         "#;
 
-        let ir = parse_or_panic(input, EmitConfig::init_only());
+        let mut ir = parse_or_panic(input, EmitConfig::init_only());
 
         let src_str = sir_data::display_program(&ir);
         let expected_src = r#"
@@ -624,12 +610,11 @@ data .1 0x5678
         "#;
         assert_trim_strings_eq_with_diff(&src_str, expected_src, "src before defragment");
 
-        let mut dst = EthIRProgram::default();
-        let mut defragmenter = Defragmenter::new();
-        defragmenter.run(&ir, &mut dst, None);
+        let store = AnalysesStore::default();
+        run_pass(&mut Defragmenter::default(), &mut ir, &store);
 
-        let dst_str = sir_data::display_program(&dst);
-        let expected_dst = r#"
+        let actual = sir_data::display_program(&ir);
+        let expected = r#"
 Init: @0
 Functions:
     fn @0 -> entry @0  (outputs: 0)
@@ -664,7 +649,6 @@ Basic Blocks:
 
 data .0 0x1234
         "#;
-        assert_trim_strings_eq_with_diff(&dst_str, expected_dst, "dst after defragment");
-        assert_eq!(sir_analyses::legalize(&dst), Ok(()));
+        assert_trim_strings_eq_with_diff(&actual, expected, "defragment dead function data");
     }
 }

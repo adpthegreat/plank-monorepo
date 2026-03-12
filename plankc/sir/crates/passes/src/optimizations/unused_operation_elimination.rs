@@ -1,29 +1,28 @@
-use sir_analyses::{DefUse, UseKind, compute_def_use};
+use crate::analyses::{AnalysesMask, DefUse, UseKind};
 use sir_data::{EthIRProgram, Idx, IndexVec, LocalId, Operation, OperationIdx};
 
+use crate::{AnalysesStore, Pass};
+
+#[derive(Default)]
 pub struct UnusedOperationElimination {
     def_sites: IndexVec<LocalId, Option<OperationIdx>>,
     pending_removals: Vec<OperationIdx>,
 }
 
-impl UnusedOperationElimination {
-    pub fn new() -> Self {
-        Self { def_sites: IndexVec::new(), pending_removals: Vec::new() }
-    }
+impl Pass for UnusedOperationElimination {
+    fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        let mut uses = store.def_use_mut(program);
 
-    pub fn run(&mut self, program: &mut EthIRProgram, uses: &mut DefUse) {
         self.def_sites.clear();
         self.def_sites.resize(program.next_free_local_id.idx(), None);
         self.pending_removals.clear();
-
-        compute_def_use(program, uses);
 
         for op in program.operations() {
             for out in op.outputs() {
                 self.def_sites[*out] = Some(op.id());
             }
 
-            if is_removable(&op.op(), program, uses) {
+            if is_removable(&op.op(), program, &uses) {
                 self.pending_removals.push(op.id());
             }
         }
@@ -35,12 +34,12 @@ impl UnusedOperationElimination {
             }
 
             for &input in op.inputs(program) {
-                uses[input].retain(|u| u.kind != UseKind::Operation(op_idx));
+                uses.retain(input, |u| u.kind != UseKind::Operation(op_idx));
 
                 if let Some(def_idx) = self.def_sites[input] {
                     let defining_op = &program.operations[def_idx];
                     if !matches!(defining_op, Operation::Noop(()))
-                        && is_removable(defining_op, program, uses)
+                        && is_removable(defining_op, program, &uses)
                     {
                         self.pending_removals.push(def_idx);
                     }
@@ -53,25 +52,27 @@ impl UnusedOperationElimination {
             program.operations[op_idx] = Operation::Noop(());
         }
     }
+
+    fn preserves(&self) -> AnalysesMask {
+        AnalysesMask::Predecessors
+            | AnalysesMask::Dominators
+            | AnalysesMask::DominanceFrontiers
+            | AnalysesMask::BasicBlockOwnership
+            | AnalysesMask::CfgInOutBundling
+            | AnalysesMask::SccpReachable
+    }
 }
 
-fn is_removable(op: &Operation, program: &EthIRProgram, uses: &DefUse) -> bool {
+fn is_removable(op: &Operation, program: &EthIRProgram, defuse: &DefUse) -> bool {
     op.kind().is_removable_when_unused()
-        && op.outputs(program).iter().all(|out| uses[*out].is_empty())
+        && op.outputs(program).iter().all(|out| defuse.uses_of(*out).is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::UnusedOperationElimination;
-    use sir_analyses::DefUse;
-    use sir_parser::{EmitConfig, parse_or_panic};
+    use crate::run_pass_and_display;
     use sir_test_utils::assert_trim_strings_eq_with_diff;
-
-    fn run_pass(source: &str) -> String {
-        let mut ir = parse_or_panic(source, EmitConfig::init_only());
-        UnusedOperationElimination::new().run(&mut ir, &mut DefUse::new());
-        sir_data::display_program(&ir)
-    }
 
     // Note: block outputs count as uses, even if the successor never uses the input.
     #[test]
@@ -123,7 +124,7 @@ Basic Blocks:
     }
         "#;
 
-        let actual = run_pass(input);
+        let actual = run_pass_and_display::<UnusedOperationElimination>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "block outputs count as uses");
     }
 
@@ -160,7 +161,7 @@ Basic Blocks:
     }
         "#;
 
-        let actual = run_pass(input);
+        let actual = run_pass_and_display::<UnusedOperationElimination>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "cross block chain eliminated");
     }
 
@@ -207,7 +208,7 @@ Basic Blocks:
     }
         "#;
 
-        let actual = run_pass(input);
+        let actual = run_pass_and_display::<UnusedOperationElimination>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "side effecting ops preserved");
     }
 
@@ -247,7 +248,7 @@ Basic Blocks:
     }
         "#;
 
-        let actual = run_pass(input);
+        let actual = run_pass_and_display::<UnusedOperationElimination>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "control flow vars preserved");
     }
 
@@ -281,7 +282,7 @@ Basic Blocks:
     }
         "#;
 
-        let actual = run_pass(input);
+        let actual = run_pass_and_display::<UnusedOperationElimination>(input);
         assert_trim_strings_eq_with_diff(&actual, expected, "mixed live dead chains");
     }
 }

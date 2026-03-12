@@ -24,12 +24,10 @@ plank-diagnostics = { path = "frontend/diagnostics" }
 
 # Sensei IR Sub Crates
 sir-data = { path = "sir/crates/data" }
-sir-analyses = { path = "sir/crates/analyses" }
+sir-passes = { path = "sir/crates/passes" }
 sir-parser = { path = "sir/crates/parser" }
 sir-assembler = { path = "sir/crates/assembler" }
 sir-debug-backend = { path = "sir/crates/debug-backend" }
-sir-optimizations = { path = "sir/crates/optimizations" }
-sir-transforms = { path = "sir/crates/transforms" }
 
 # Shared Dependencies
 bumpalo = { version = "3.19.0", features = ["allocator-api2", "collections"] }
@@ -38,6 +36,7 @@ hashbrown = { version = "0.16.0", features = ["allocator-api2"] }
 smallvec = "1.15.1"
 alloy-primitives = "1.1.2"
 thiserror = "2.0.17"
+bitflags = "2"
 logos = "0.16.0"
 chumsky = "0.11.1"
 index_vec = "0.1.4"

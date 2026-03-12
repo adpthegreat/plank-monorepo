@@ -1,101 +1,84 @@
+use crate::{
+    AnalysesStore, Pass, analyses::DominanceFrontiers, run_pass, transforms::CriticalEdgeSplitting,
+};
 use hashbrown::HashSet;
 use plank_core::IncIterable;
-use sir_analyses::{
-    compute_dominance_frontiers, compute_dominators_from_predecessors, compute_predecessors,
-};
-use sir_data::{
-    BasicBlock, BasicBlockId, Branch, Control, EthIRProgram, Idx, IndexVec, LocalId, LocalIdx,
-    Span, Switch, index_vec,
-};
+use sir_data::{BasicBlockId, Control, EthIRProgram, Idx, IndexVec, LocalId, Span, index_vec};
 
-pub fn ssa_transform(program: &mut EthIRProgram) {
-    let mut predecessors = IndexVec::new();
-    compute_predecessors(program, &mut predecessors);
-    split_critical_edges(program, &predecessors);
-    compute_predecessors(program, &mut predecessors);
-    SsaTransform::new(program, predecessors).run(program);
-}
-
-struct SsaTransform {
+#[derive(Default)]
+pub struct SsaTransform {
     def_sites: IndexVec<LocalId, HashSet<BasicBlockId>>,
     dominators: IndexVec<BasicBlockId, Vec<BasicBlockId>>,
     phi_locations: IndexVec<BasicBlockId, Vec<LocalId>>,
-    dominance_frontiers: IndexVec<BasicBlockId, HashSet<BasicBlockId>>,
+    worklist: Vec<BasicBlockId>,
+}
+
+impl Pass for SsaTransform {
+    fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        // CriticalEdgeSplitting is stateless, no benefit from reuse
+        run_pass(&mut CriticalEdgeSplitting, program, store);
+
+        debug_assert!(self.worklist.is_empty());
+        for parent in self.dominators.iter_mut() {
+            parent.clear();
+        }
+        self.dominators.resize(program.basic_blocks.len(), Vec::new());
+
+        let dominators_child_to_parent = store.dominators(program);
+        for bb in program.basic_blocks.iter_idx() {
+            if let Some(parent) = dominators_child_to_parent.of(bb)
+                && parent != bb
+            {
+                self.dominators[parent].push(bb);
+            }
+        }
+
+        self.collect_definition_sites(program);
+
+        self.phi_locations.clear();
+        self.phi_locations.resize(program.basic_blocks.len(), Vec::new());
+        self.compute_phi_locations(&store.dominance_frontiers(program));
+
+        self.rename(program);
+    }
 }
 
 impl SsaTransform {
-    fn new(
-        program: &EthIRProgram,
-        predecessors: IndexVec<BasicBlockId, Vec<BasicBlockId>>,
-    ) -> Self {
-        let dominators_child_to_parent =
-            compute_dominators_from_predecessors(program, &predecessors);
-        let mut dominators_parent_to_child =
-            index_vec![Vec::new(); dominators_child_to_parent.len()];
-        for (bb, &idom) in dominators_child_to_parent.enumerate_idx() {
-            if let Some(parent) = idom
-                && parent != bb
-            {
-                dominators_parent_to_child[parent].push(bb);
-            }
-        }
-
-        let dominance_frontiers =
-            compute_dominance_frontiers(&dominators_child_to_parent, &predecessors);
-
-        let def_sites = Self::collect_definition_sites(program);
-
-        Self {
-            def_sites,
-            dominators: dominators_parent_to_child,
-            dominance_frontiers,
-            phi_locations: index_vec![Vec::new(); program.basic_blocks.len()],
-        }
-    }
-
-    fn run(&mut self, program: &mut EthIRProgram) {
-        self.compute_phi_locations();
-        self.rename(program);
-    }
-
-    fn collect_definition_sites(
-        program: &EthIRProgram,
-    ) -> IndexVec<LocalId, HashSet<BasicBlockId>> {
-        let mut def_sites = index_vec![HashSet::new(); program.next_free_local_id.idx()];
+    fn collect_definition_sites(&mut self, program: &EthIRProgram) {
+        self.def_sites.clear();
+        self.def_sites.resize(program.next_free_local_id.idx(), HashSet::new());
         for block in program.blocks() {
             for &local in block.inputs() {
-                def_sites[local].insert(block.id());
+                self.def_sites[local].insert(block.id());
             }
             for op in block.operations() {
                 for &local in op.outputs() {
-                    def_sites[local].insert(block.id());
+                    self.def_sites[local].insert(block.id());
                 }
             }
         }
-        def_sites
     }
 
-    fn compute_phi_locations(&mut self) {
-        let mut worklist = Vec::new();
+    fn compute_phi_locations(&mut self, dominance_frontiers: &DominanceFrontiers) {
         for (local, def_blocks) in self.def_sites.enumerate_idx() {
             if def_blocks.len() <= 1 {
                 continue;
             }
             for bb in def_blocks {
-                worklist.push(*bb);
+                self.worklist.push(*bb);
             }
-            while let Some(bb) = worklist.pop() {
-                for &frontier_block in &self.dominance_frontiers[bb] {
+            while let Some(bb) = self.worklist.pop() {
+                for &frontier_block in dominance_frontiers.of(bb) {
                     if !self.phi_locations[frontier_block].contains(&local) {
                         self.phi_locations[frontier_block].push(local);
-                        worklist.push(frontier_block);
+                        self.worklist.push(frontier_block);
                     }
                 }
             }
         }
     }
 
-    fn rename(&mut self, program: &mut EthIRProgram) {
+    fn rename(&self, program: &mut EthIRProgram) {
         let num_locals = program.next_free_local_id.idx();
         let mut local_versions = index_vec![Vec::new(); num_locals];
         let mut rename_trail = Vec::new();
@@ -110,7 +93,7 @@ impl SsaTransform {
     }
 
     fn rename_block(
-        &mut self,
+        &self,
         program: &mut EthIRProgram,
         bb: BasicBlockId,
         local_versions: &mut IndexVec<LocalId, Vec<LocalId>>,
@@ -134,9 +117,8 @@ impl SsaTransform {
 
         self.rename_block_outputs(program, bb, local_versions);
 
-        for i in 0..self.dominators[bb].len() {
-            let child = self.dominators[bb][i];
-            self.rename_block(program, child, local_versions, rename_trail);
+        for child in &self.dominators[bb] {
+            self.rename_block(program, *child, local_versions, rename_trail);
         }
 
         for local in &rename_trail[checkpoint..] {
@@ -228,86 +210,10 @@ fn rename_def(
     new_version
 }
 
-fn split_critical_edges(
-    program: &mut EthIRProgram,
-    predecessors: &IndexVec<BasicBlockId, Vec<BasicBlockId>>,
-) {
-    for bb in program.basic_blocks.iter_idx() {
-        match program.basic_blocks[bb].control {
-            Control::Branches(Branch { condition, non_zero_target, zero_target }) => {
-                program.basic_blocks[bb].control = Control::Branches(Branch {
-                    condition,
-                    non_zero_target: split_edge(program, predecessors, bb, non_zero_target),
-                    zero_target: split_edge(program, predecessors, bb, zero_target),
-                });
-            }
-            Control::Switch(Switch { cases, fallback, .. }) => {
-                let cases_data = program.cases[cases];
-                for target_idx in cases_data.target_indices().iter() {
-                    let target = program.cases_bb_ids[target_idx];
-                    program.cases_bb_ids[target_idx] =
-                        split_edge(program, predecessors, bb, target);
-                }
-                if let Some(fallback) = fallback {
-                    let new_fallback = split_edge(program, predecessors, bb, fallback);
-                    let Control::Switch(ref mut switch) = program.basic_blocks[bb].control else {
-                        unreachable!()
-                    };
-                    switch.fallback = Some(new_fallback);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn split_edge(
-    program: &mut EthIRProgram,
-    predecessors: &IndexVec<BasicBlockId, Vec<BasicBlockId>>,
-    source: BasicBlockId,
-    target: BasicBlockId,
-) -> BasicBlockId {
-    if predecessors[target].len() > 1 {
-        insert_forwarding_block(program, source, target)
-    } else {
-        target
-    }
-}
-
-fn insert_forwarding_block(
-    program: &mut EthIRProgram,
-    source: BasicBlockId,
-    target: BasicBlockId,
-) -> BasicBlockId {
-    let source_outputs = program.basic_blocks[source].outputs;
-    let empty_ops = Span::new(program.operations.next_idx(), program.operations.next_idx());
-
-    let inputs_start = program.locals.next_idx();
-    for _ in source_outputs.iter() {
-        program.locals.push(program.next_free_local_id.get_and_inc());
-    }
-    let inputs = Span::new(inputs_start, program.locals.next_idx());
-    let outputs = copy_span(program, inputs);
-
-    program.basic_blocks.push(BasicBlock {
-        inputs,
-        outputs,
-        operations: empty_ops,
-        control: Control::ContinuesTo(target),
-    })
-}
-
-fn copy_span(program: &mut EthIRProgram, span: Span<LocalIdx>) -> Span<LocalIdx> {
-    let start = program.locals.next_idx();
-    for idx in span.iter() {
-        program.locals.push(program.locals[idx]);
-    }
-    Span::new(start, program.locals.next_idx())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Legalizer;
     use sir_data::display_program;
     use sir_parser::EmitConfig;
 
@@ -317,10 +223,10 @@ mod tests {
         sir_parser::parse_without_legalization(source, config)
     }
 
-    fn transform_and_legalize(program: &mut EthIRProgram) {
-        ssa_transform(program);
+    fn transform_and_legalize(program: &mut EthIRProgram, store: &AnalysesStore) {
+        run_pass(&mut SsaTransform::default(), program, store);
         let ir = display_program(program);
-        sir_analyses::legalize(program).unwrap_or_else(|e| panic!("{e}\n{ir}"));
+        Legalizer::default().run(program, store).unwrap_or_else(|e| panic!("{e}\n{ir}"));
     }
 
     #[test]
@@ -356,7 +262,7 @@ mod tests {
         let d = BasicBlockId::new(3);
         let original_v = program.block(d).inputs()[0];
 
-        transform_and_legalize(&mut program);
+        transform_and_legalize(&mut program, &AnalysesStore::default());
         let post_ir = display_program(&program);
 
         let d_inputs = program.block(d).inputs();
@@ -400,7 +306,7 @@ mod tests {
         let d = BasicBlockId::new(3);
         let original_v = program.block(d).inputs()[0];
 
-        transform_and_legalize(&mut program);
+        transform_and_legalize(&mut program, &AnalysesStore::default());
         let post_ir = display_program(&program);
 
         let d_inputs = program.block(d).inputs();
@@ -445,7 +351,7 @@ mod tests {
         let b = BasicBlockId::new(1);
         let original_v = program.block(b).inputs()[0];
 
-        transform_and_legalize(&mut program);
+        transform_and_legalize(&mut program, &AnalysesStore::default());
         let post_ir = display_program(&program);
 
         let b_inputs = program.block(b).inputs();
@@ -492,7 +398,7 @@ mod tests {
         let original_x = program.block(d).inputs()[0];
         let original_y = program.block(d).inputs()[1];
 
-        transform_and_legalize(&mut program);
+        transform_and_legalize(&mut program, &AnalysesStore::default());
         let post_ir = display_program(&program);
 
         let d_inputs = program.block(d).inputs();
@@ -501,63 +407,6 @@ mod tests {
             assert_ne!(input, original_x, "x should be renamed\n{post_ir}");
             assert_ne!(input, original_y, "y should be renamed\n{post_ir}");
         }
-    }
-
-    #[test]
-    fn test_critical_edge_and_switch_phi() {
-        //     A
-        //    / \
-        //   B   C
-        //  / \  |
-        // E   D-+
-        //
-        // v defined in A and B. B uses a switch, so B→D is a critical edge.
-        let mut program = parse_without_ssa(
-            r#"
-            fn init:
-                a -> v {
-                    v = const 1
-                    cond = const 0
-                    => cond ? @b : @c
-                }
-                b v -> v {
-                    v = const 2
-                    sel = const 0
-                    switch sel {
-                        0 => @d
-                        default => @e
-                    }
-                }
-                c v -> v {
-                    => @d
-                }
-                d v {
-                    stop
-                }
-                e v {
-                    stop
-                }
-            "#,
-        );
-
-        let d = BasicBlockId::new(3);
-        let original_block_count = program.basic_blocks.len();
-        let original_v = program.block(d).inputs()[0];
-
-        transform_and_legalize(&mut program);
-        let post_ir = display_program(&program);
-
-        assert!(
-            program.basic_blocks.len() > original_block_count,
-            "critical edge splitting should insert forwarding blocks\n{post_ir}"
-        );
-
-        let d_inputs = program.block(d).inputs();
-        assert_eq!(d_inputs.len(), 2, "D should have original input + phi\n{post_ir}");
-        for &input in d_inputs {
-            assert_ne!(input, original_v, "phi input should be renamed\n{post_ir}");
-        }
-        assert_ne!(d_inputs[0], d_inputs[1], "phi inputs should be distinct\n{post_ir}");
     }
 
     #[test]
@@ -603,7 +452,7 @@ mod tests {
         let helper_id = program.functions.iter_idx().find(|&id| id != program.init_entry).unwrap();
         let helper_entry = program.functions[helper_id].entry();
 
-        transform_and_legalize(&mut program);
+        transform_and_legalize(&mut program, &AnalysesStore::default());
         let post_ir = display_program(&program);
 
         let init_inputs = program.block(init_entry).inputs();
