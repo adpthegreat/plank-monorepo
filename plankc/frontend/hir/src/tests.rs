@@ -1,31 +1,63 @@
 use crate::{BigNumInterner, Hir, display::DisplayHir};
+use plank_diagnostics::SimpleCollector;
 use plank_parser::{PlankInterner, error_report::ParserError};
+use plank_source::ParsedProject;
 use plank_test_utils::{TestProject, dedent_preserve_blank_lines};
 
-fn try_lower(source: &str) -> Result<(Hir, BigNumInterner, PlankInterner), Vec<ParserError>> {
+fn try_lower(
+    source: &str,
+) -> Result<(Hir, BigNumInterner, PlankInterner, SimpleCollector, ParsedProject), Vec<ParserError>>
+{
+    try_lower_project(TestProject::single(source))
+}
+
+fn try_lower_project(
+    project: TestProject,
+) -> Result<(Hir, BigNumInterner, PlankInterner, SimpleCollector, ParsedProject), Vec<ParserError>>
+{
     let mut interner = PlankInterner::default();
-    let project = TestProject::single(source)
+    let project = project
         .build(&mut interner)
         .map_err(|collector| collector.errors.into_iter().map(|(_, e)| e).collect::<Vec<_>>())?;
 
     let mut big_nums = BigNumInterner::default();
-    let hir =
-        crate::lower(&project, &mut big_nums, &mut plank_diagnostics::SimpleCollector::default());
+    let mut collector = SimpleCollector::default();
+    let hir = crate::lower(&project, &mut big_nums, &interner, &mut collector);
 
-    Ok((hir, big_nums, interner))
+    Ok((hir, big_nums, interner, collector, project))
 }
 
 fn assert_lowers_to(source: &str, expected: &str) {
-    let (hir, big_nums, interner) = match try_lower(source) {
+    let (hir, big_nums, interner, collector, _project) = match try_lower(source) {
         Ok(values) => values,
         Err(errors) => {
             panic!("Expected no parse errors, got: {}\n{:#?}", errors.len(), errors);
         }
     };
+    assert!(
+        collector.diagnostics().is_empty(),
+        "Expected no diagnostics for valid source, got:\n{:#?}",
+        collector.diagnostics()
+    );
     let actual = format!("{}", DisplayHir::new(&hir, &big_nums, &interner));
     let expected = dedent_preserve_blank_lines(expected);
 
     pretty_assertions::assert_str_eq!(actual.trim(), expected.trim());
+}
+
+fn render_diagnostics(source: &str) -> String {
+    render_project_diagnostics(TestProject::single(source))
+}
+
+fn render_project_diagnostics(project: TestProject) -> String {
+    let (_hir, _big_nums, _interner, collector, project) =
+        try_lower_project(project).expect("should not have parse errors");
+    collector
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.render(&project.sources))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -127,28 +159,44 @@ fn test_inline_closure_lowering() {
 }
 
 #[test]
-#[should_panic(expected = "unresolved assignment target")]
 fn test_set_undefined() {
-    let _ = try_lower(
-        "
-        init {
-            y = 4;
-        }
-        ",
+    let rendered = render_diagnostics("init { y = 4; }");
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unresolved identifier 'y'
+         --> main.plk:1:8
+          |
+        1 | init { y = 4; }
+          |        ^ not found in this scope
+        "#,
     );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }
 
 #[test]
-#[should_panic(expected = "assignment to immutable variable")]
 fn test_assign_to_immutable_let() {
-    let _ = try_lower(
-        "
+    let rendered = render_diagnostics(
+        r#"
         init {
             let x = 1;
             x = 2;
         }
-        ",
+        "#,
     );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: variable 'x' was not declared mutable
+         --> main.plk:3:5
+          |
+        2 |     let x = 1;
+          |         - declared here
+        3 |     x = 2;
+          |     ^ assignment to immutable variable
+          |
+          = help: consider declaring it with `let mut`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }
 
 #[test]
@@ -220,4 +268,300 @@ fn test_assign_to_mutable_let() {
         %0 := 2
         "#,
     );
+}
+
+#[test]
+fn test_unresolved_identifier_diagnostic() {
+    let rendered = render_diagnostics("init { x; }");
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unresolved identifier 'x'
+         --> main.plk:1:8
+          |
+        1 | init { x; }
+          |        ^ not found in this scope
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_multiple_init_blocks() {
+    let rendered = render_diagnostics(
+        r#"
+        init {}
+        init {}
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: multiple init blocks
+         --> main.plk:2:1
+          |
+        1 | init {}
+          | ------- previous init block
+        2 | init {}
+          | ^^^^^^^ duplicate init block
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_multiple_run_blocks() {
+    let rendered = render_diagnostics(
+        r#"
+        init {}
+        run {}
+        run {}
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: multiple run blocks
+         --> main.plk:3:1
+          |
+        2 | run {}
+          | ------ previous run block
+        3 | run {}
+          | ^^^^^^ duplicate run block
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_duplicate_const_def() {
+    let rendered = render_diagnostics(
+        r#"
+        const x = 1;
+        const x = 2;
+        init {}
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: duplicate definition of 'x'
+         --> main.plk:2:1
+          |
+        1 | const x = 1;
+          | ------------ previously defined here
+        2 | const x = 2;
+          | ^^^^^^^^^^^^ 'x' redefined here
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_init_and_run_outside_entry() {
+    let project = TestProject::single("import m::other::*;\ninit {}")
+        .add_file(
+            "other",
+            "
+            init {}
+            run {}
+            ",
+        )
+        .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: init not allowed here
+         --> other.plk:1:1
+          |
+        1 | init {}
+          | ^^^^^^^ only the entry file may contain init
+        error: run not allowed here
+         --> other.plk:2:1
+          |
+        2 | run {}
+          | ^^^^^^ only the entry file may contain run
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_import_name_collision() {
+    let project = TestProject::single("const x = 1;\nimport m::other::x;\ninit {}")
+        .add_file("other", "const x = 2;")
+        .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: import of 'x' conflicts with existing definition
+         --> main.plk:2:18
+          |
+        1 | const x = 1;
+          | ------------ previously defined here
+        2 | import m::other::x;
+          |                  ^ conflicting import
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_glob_import_name_collision() {
+    let project = TestProject::single("const x = 1;\nimport m::other::*;\ninit {}")
+        .add_file("other", "const x = 2;")
+        .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: import of 'x' conflicts with existing definition
+         --> main.plk:2:1
+          |
+        1 | const x = 1;
+          | ------------ previously defined here
+        2 | import m::other::*;
+          | ^^^^^^^^^^^^^^^^^^^ conflicting import
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_import_collision_with_previous_import() {
+    let project = TestProject::single("import m::a::x;\nimport m::b::x;\ninit {}")
+        .add_file("a", "const x = 1;")
+        .add_file("b", "const x = 2;")
+        .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: import of 'x' conflicts with existing definition
+         --> main.plk:2:14
+          |
+        1 | import m::a::x;
+          |              - previously imported here
+        2 | import m::b::x;
+          |              ^ conflicting import
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_unresolved_import() {
+    let project = TestProject::single("import m::other::y;\ninit {}")
+        .add_file("other", "const x = 1;")
+        .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = "\
+error: unresolved import 'y'
+ --> main.plk:1:18
+  |
+1 | import m::other::y;
+  |                  ^ not found in target module
+  |
+ ::: other.plk:1:1
+  |
+1 | const x = 1;
+  | - target module";
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_shadow_primitive_type() {
+    let rendered = render_diagnostics("init { let u256 = 1; }");
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: cannot shadow primitive type 'u256'
+         --> main.plk:1:12
+          |
+        1 | init { let u256 = 1; }
+          |            ^^^^ is a primitive type
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_shadow_builtin() {
+    let rendered = render_diagnostics("init { let add = 1; }");
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: cannot shadow built-in function 'add'
+         --> main.plk:1:12
+          |
+        1 | init { let add = 1; }
+          |            ^^^ is a built-in function
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_missing_init_block() {
+    let rendered = render_diagnostics("const x = 1;");
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: missing init block
+          |
+          = note: the entry file must contain an init block
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_non_call_reference_to_builtin() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let mut x = 0;
+            x = add;
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: cannot reference built-in function 'add' as a value
+         --> main.plk:3:9
+          |
+        3 |     x = add;
+          |         ^^^ must be called directly
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_number_out_of_range() {
+    let rendered = render_diagnostics(
+        "init { let x = 0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; }",
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: number literal out of range
+         --> main.plk:1:16
+          |
+        1 | init { let x = 0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; }
+          |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ value does not fit in u256
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_inline_while_not_yet_supported() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            inline while true {}
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: inline while is not yet supported
+         --> main.plk:2:5
+          |
+        2 |     inline while true {}
+          |     ^^^^^^^^^^^^^^^^^^^^ not yet supported
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }

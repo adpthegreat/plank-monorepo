@@ -99,7 +99,7 @@ fn main() {
 
     let mut big_nums = BigNumInterner::new();
     let mut collector = plank_diagnostics::SimpleCollector::default();
-    let hir = lower(&project, &mut big_nums, &mut collector);
+    let hir = lower(&project, &mut big_nums, &interner, &mut collector);
 
     if args.show_hir {
         if args.show_mir {

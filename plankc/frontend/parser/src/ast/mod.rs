@@ -80,6 +80,10 @@ impl<'cst> ConstDecl<'cst> {
     pub fn span(&self) -> Span<TokenIdx> {
         self.view.span()
     }
+
+    pub fn name_span(&self) -> Span<TokenIdx> {
+        self.view.child(0).expect("ConstDecl must have name child").span()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +125,15 @@ impl<'cst> Import<'cst> {
                 buf.push(ident);
             }
         }
+    }
+
+    pub fn last_path_segment_span(&self) -> Span<TokenIdx> {
+        self.path_node
+            .children()
+            .filter(|c| c.ident().is_some())
+            .last()
+            .expect("import must have at least one path segment")
+            .span()
     }
 }
 

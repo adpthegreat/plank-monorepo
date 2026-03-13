@@ -1,6 +1,9 @@
+use plank_core::Span;
+
 use crate::{
     StrId,
     cst::{BinaryOp, NodeKind, NodeView, NumLitId, UnaryOp},
+    lexer::TokenIdx,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -16,8 +19,8 @@ pub enum Expr<'cst> {
     Block(BlockExpr<'cst>),
     ComptimeBlock(BlockExpr<'cst>),
     BoolLiteral(bool),
-    NumLiteral { negative: bool, id: NumLitId },
-    Ident(StrId),
+    NumLiteral { negative: bool, id: NumLitId, span: Span<TokenIdx> },
+    Ident { name: StrId, span: Span<TokenIdx> },
 }
 
 impl<'cst> Expr<'cst> {
@@ -48,8 +51,10 @@ impl<'cst> Expr<'cst> {
                 NodeKind::Block => Expr::Block(BlockExpr { view }),
                 NodeKind::ComptimeBlock => Expr::ComptimeBlock(BlockExpr { view }),
                 NodeKind::BoolLiteral(value) => Expr::BoolLiteral(value),
-                NodeKind::NumLiteral { negative, id } => Expr::NumLiteral { negative, id },
-                NodeKind::Identifier { ident } => Expr::Ident(ident),
+                NodeKind::NumLiteral { negative, id } => {
+                    Expr::NumLiteral { negative, id, span: view.span() }
+                }
+                NodeKind::Identifier { ident } => Expr::Ident { name: ident, span: view.span() },
                 _ => return None,
             };
             return Some(expr);
@@ -369,6 +374,10 @@ impl<'cst> Param<'cst> {
         Expr::new_unwrap(node)
     }
 
+    pub fn name_span(&self) -> Span<TokenIdx> {
+        self.view.child(0).expect("Parameter must have name child").span()
+    }
+
     pub fn node(&self) -> NodeView<'cst> {
         self.view
     }
@@ -382,6 +391,7 @@ pub struct BlockExpr<'cst> {
 #[derive(Debug, Clone, Copy)]
 pub struct LetStmt<'cst> {
     pub name: StrId,
+    pub name_span: Span<TokenIdx>,
     pub mutable: bool,
     type_view: Option<NodeView<'cst>>,
     value_view: NodeView<'cst>,
@@ -393,10 +403,12 @@ impl<'cst> LetStmt<'cst> {
             return None;
         };
         let mut children = view.children();
-        let name = children.next().and_then(NodeView::ident).expect("TODO: malformed");
+        let name_view = children.next().expect("TODO: malformed");
+        let name_span = name_view.span();
+        let name = name_view.ident().expect("TODO: malformed");
         let type_view = typed.then(|| children.next().expect("TODO: malformed"));
         let value_view = children.next().expect("TODO: malformed");
-        Some(Self { name, mutable, type_view, value_view })
+        Some(Self { name, name_span, mutable, type_view, value_view })
     }
 
     pub fn type_expr(&self) -> Option<Expr<'cst>> {
