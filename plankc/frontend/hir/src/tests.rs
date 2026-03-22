@@ -1,45 +1,30 @@
 use crate::{BigNumInterner, Hir, display::DisplayHir};
-use plank_diagnostics::SimpleCollector;
-use plank_parser::{PlankInterner, error_report::ParserError};
+use plank_session::Session;
 use plank_source::ParsedProject;
 use plank_test_utils::{TestProject, dedent_preserve_blank_lines};
 
-fn try_lower(
-    source: &str,
-) -> Result<(Hir, BigNumInterner, PlankInterner, SimpleCollector, ParsedProject), Vec<ParserError>>
-{
+fn try_lower(source: &str) -> (Hir, BigNumInterner, Session, ParsedProject) {
     try_lower_project(TestProject::single(source))
 }
 
-fn try_lower_project(
-    project: TestProject,
-) -> Result<(Hir, BigNumInterner, PlankInterner, SimpleCollector, ParsedProject), Vec<ParserError>>
-{
-    let mut interner = PlankInterner::default();
-    let project = project
-        .build(&mut interner)
-        .map_err(|collector| collector.errors.into_iter().map(|(_, e)| e).collect::<Vec<_>>())?;
+fn try_lower_project(project: TestProject) -> (Hir, BigNumInterner, Session, ParsedProject) {
+    let mut session = Session::new();
+    let project = project.build(&mut session);
 
     let mut big_nums = BigNumInterner::default();
-    let mut collector = SimpleCollector::default();
-    let hir = crate::lower(&project, &mut big_nums, &interner, &mut collector);
+    let hir = crate::lower(&project, &mut big_nums, &mut session);
 
-    Ok((hir, big_nums, interner, collector, project))
+    (hir, big_nums, session, project)
 }
 
 fn assert_lowers_to(source: &str, expected: &str) {
-    let (hir, big_nums, interner, collector, _project) = match try_lower(source) {
-        Ok(values) => values,
-        Err(errors) => {
-            panic!("Expected no parse errors, got: {}\n{:#?}", errors.len(), errors);
-        }
-    };
+    let (hir, big_nums, session, _project) = try_lower(source);
     assert!(
-        collector.diagnostics().is_empty(),
+        session.diagnostics().is_empty(),
         "Expected no diagnostics for valid source, got:\n{:#?}",
-        collector.diagnostics()
+        session.diagnostics()
     );
-    let actual = format!("{}", DisplayHir::new(&hir, &big_nums, &interner));
+    let actual = format!("{}", DisplayHir::new(&hir, &big_nums, &session));
     let expected = dedent_preserve_blank_lines(expected);
 
     pretty_assertions::assert_str_eq!(actual.trim(), expected.trim());
@@ -50,12 +35,11 @@ fn render_diagnostics(source: &str) -> String {
 }
 
 fn render_project_diagnostics(project: TestProject) -> String {
-    let (_hir, _big_nums, _interner, collector, project) =
-        try_lower_project(project).expect("should not have parse errors");
-    collector
+    let (_hir, _big_nums, session, _project) = try_lower_project(project);
+    session
         .diagnostics()
         .iter()
-        .map(|diagnostic| diagnostic.render(&project.sources))
+        .map(|diagnostic| diagnostic.render_plain(&session))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -367,16 +351,22 @@ fn test_init_and_run_outside_entry() {
     let rendered = render_project_diagnostics(project);
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: init not allowed here
+        error: `init` not allowed here
          --> other.plk:1:1
           |
         1 | init {}
-          | ^^^^^^^ only the entry file may contain init
-        error: run not allowed here
+          | ^^^^^^^ only the entry file may contain `init`
+          |
+        note: entry file
+         --> main.plk
+        error: `run` not allowed here
          --> other.plk:2:1
           |
         2 | run {}
-          | ^^^^^^ only the entry file may contain run
+          | ^^^^^^ only the entry file may contain `run`
+          |
+        note: entry file
+         --> main.plk
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -390,13 +380,13 @@ fn test_import_name_collision() {
     let rendered = render_project_diagnostics(project);
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: import of 'x' conflicts with existing definition
-         --> main.plk:2:18
+        error: imported definition collision
+         --> main.plk:2:1
           |
         1 | const x = 1;
-          | ------------ previously defined here
+          | ------------ 'x' previously defined here
         2 | import m::other::x;
-          |                  ^ conflicting import
+          | ^^^^^^^^^^^^^^^^^^^ conflicting import
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -404,19 +394,50 @@ fn test_import_name_collision() {
 
 #[test]
 fn test_glob_import_name_collision() {
-    let project = TestProject::single("const x = 1;\nimport m::other::*;\ninit {}")
-        .add_file("other", "const x = 2;")
+    let project = TestProject::single(
+        r#"
+        const x = 1;
+        import m::other::*;
+        init {}
+        "#,
+    )
+    .add_file("other", "const x = 2;")
+    .add_module("m", "");
+    let rendered = render_project_diagnostics(project);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: imported definition collision
+         --> main.plk:2:1
+          |
+        1 | const x = 1;
+          | ------------ 'x' previously defined here
+        2 | import m::other::*;
+          | ^^^^^^^^^^^^^^^^^^^ conflicting import
+          |
+         ::: other.plk:1:1
+          |
+        1 | const x = 2;
+          | ------------ imported colliding 'x'
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_alias_import_collision() {
+    let project = TestProject::single("const x = 1;\nimport m::other::y as x;\ninit {}")
+        .add_file("other", "const y = 2;")
         .add_module("m", "");
     let rendered = render_project_diagnostics(project);
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: import of 'x' conflicts with existing definition
+        error: imported definition collision
          --> main.plk:2:1
           |
         1 | const x = 1;
-          | ------------ previously defined here
-        2 | import m::other::*;
-          | ^^^^^^^^^^^^^^^^^^^ conflicting import
+          | ------------ 'x' previously defined here
+        2 | import m::other::y as x;
+          | ^^^^^^^^^^^^^^^^^^^^^^^^ conflicting import
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -431,13 +452,13 @@ fn test_import_collision_with_previous_import() {
     let rendered = render_project_diagnostics(project);
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: import of 'x' conflicts with existing definition
-         --> main.plk:2:14
+        error: imported definition collision
+         --> main.plk:2:1
           |
         1 | import m::a::x;
-          |              - previously imported here
+          | --------------- 'x' previously imported here
         2 | import m::b::x;
-          |              ^ conflicting import
+          | ^^^^^^^^^^^^^^^ conflicting import
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -449,17 +470,18 @@ fn test_unresolved_import() {
         .add_file("other", "const x = 1;")
         .add_module("m", "");
     let rendered = render_project_diagnostics(project);
-    let expected = "\
-error: unresolved import 'y'
- --> main.plk:1:18
-  |
-1 | import m::other::y;
-  |                  ^ not found in target module
-  |
- ::: other.plk:1:1
-  |
-1 | const x = 1;
-  | - target module";
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unresolved import
+         --> main.plk:1:18
+          |
+        1 | import m::other::y;
+          |                  ^ 'y' not found in target module
+          |
+        info: no definition of 'y' found in file
+         --> other.plk
+        "#,
+    );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }
 
@@ -468,11 +490,11 @@ fn test_shadow_primitive_type() {
     let rendered = render_diagnostics("init { let u256 = 1; }");
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: cannot shadow primitive type 'u256'
+        error: shadowing primitive type
          --> main.plk:1:12
           |
         1 | init { let u256 = 1; }
-          |            ^^^^ is a primitive type
+          |            ^^^^ 'u256' is a primitive type
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -483,11 +505,11 @@ fn test_shadow_builtin() {
     let rendered = render_diagnostics("init { let add = 1; }");
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: cannot shadow built-in function 'add'
+        error: shadowing built-in function
          --> main.plk:1:12
           |
         1 | init { let add = 1; }
-          |            ^^^ is a built-in function
+          |            ^^^ 'add' is a built-in function
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -499,7 +521,7 @@ fn test_missing_init_block() {
     let expected = dedent_preserve_blank_lines(
         r#"
         error: missing init block
-          |
+         --> main.plk
           = note: the entry file must contain an init block
         "#,
     );
@@ -518,11 +540,13 @@ fn test_non_call_reference_to_builtin() {
     );
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: cannot reference built-in function 'add' as a value
+        error: referencing built-in function as a value
          --> main.plk:3:9
           |
         3 |     x = add;
-          |         ^^^ must be called directly
+          |         ^^^ 'add' is a built-in function
+          |
+          = help: built-in functions must be called directly, wrap in a function if you wish to use it as a first-class value
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
