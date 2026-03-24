@@ -1,11 +1,11 @@
 use clap::Parser;
-use plank_hir::{display::DisplayHir, lower};
+use plank_driver::Driver;
+use plank_hir::display::DisplayHir;
 use plank_mir::display::DisplayMir;
 use plank_parser::cst::display::DisplayCST;
-use plank_session::{Session, SourceId};
-use plank_source::{ModuleResolver, parse_project, source_fs::RealFs};
-use plank_values::BigNumInterner;
-use sir_passes::{OPTIMIZE_HELP, PassManager, parse_optimizations_string};
+use plank_session::SourceId;
+use plank_source::source_fs::RealFs;
+use sir_passes::{OPTIMIZE_HELP, parse_optimizations_string};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -46,10 +46,9 @@ fn parse_dep(s: &str) -> Result<(String, PathBuf), String> {
 
 fn main() {
     let args = Args::parse();
-    let mut session = Session::new();
-    let mut module_resolver = ModuleResolver::default();
+    let mut driver = Driver::new(&RealFs);
+
     if let Some(name) = &args.module_name {
-        let name_id = session.intern(name);
         let root = match &args.module_root {
             Some(root) => PathBuf::from(root),
             None => Path::new(&args.file_path)
@@ -57,32 +56,27 @@ fn main() {
                 .expect("file path has no parent directory")
                 .to_path_buf(),
         };
-        module_resolver.register(name_id, root);
+        driver.register_module(name, root);
     }
     for (name, path) in &args.deps {
-        let name_id = session.intern(name);
-        module_resolver.register(name_id, path.clone());
+        driver.register_module(name, path.clone());
     }
 
-    let project =
-        parse_project(Path::new(&args.file_path), &module_resolver, &mut session, &RealFs);
+    let project = match driver.load_project(Path::new(&args.file_path)) {
+        Some(project) => project,
+        None => {
+            driver.render_diagnostics_and_exit();
+        }
+    };
 
     if args.show_cst {
         let parsed = &project.parsed_sources[SourceId::ROOT];
-        let source = session.get_source(SourceId::ROOT);
+        let source = driver.session.get_source(SourceId::ROOT);
         let display = DisplayCST::new(&parsed.cst, &source.content, &parsed.lexed);
         println!("{}", display);
     }
 
-    if session.has_errors() {
-        for diagnostic in session.diagnostics() {
-            eprintln!("{}\n", diagnostic.render_plain(&session));
-        }
-        std::process::exit(1);
-    }
-
-    let mut big_nums = BigNumInterner::new();
-    let hir = lower(&project, &mut big_nums, &mut session);
+    let hir = driver.lower_hir(&project);
 
     if args.show_hir {
         if args.show_mir {
@@ -90,7 +84,7 @@ fn main() {
             println!("//                            HIR                             //");
             println!("////////////////////////////////////////////////////////////////");
         }
-        print!("{}", DisplayHir::new(&hir, &big_nums, &session));
+        print!("{}", DisplayHir::new(&hir, &driver.big_nums, &driver.session));
         if args.show_mir {
             println!("\n");
             println!("////////////////////////////////////////////////////////////////");
@@ -99,25 +93,17 @@ fn main() {
         }
     }
 
-    let mir = plank_hir_eval::evaluate(&hir);
+    let mir = driver.evaluate_hir(&hir);
 
     if args.show_mir {
-        print!("{}", DisplayMir::new(&mir, &big_nums));
+        print!("{}", DisplayMir::new(&mir, &driver.big_nums));
     }
 
-    let mut program = plank_mir_lower::lower(&mir, &big_nums);
-    let mut pass_manager = PassManager::new(&mut program);
-    if args.already_ssa {
-        pass_manager.run_legalize().expect("illegal IR pre-ssa");
-    } else {
-        pass_manager.run_ssa_transform();
-    }
-    if let Some(passes) = args.optimize {
-        pass_manager.run_optimizations(&passes);
+    if driver.session.has_errors() {
+        driver.render_diagnostics_and_exit();
     }
 
-    let mut bytecode = Vec::with_capacity(0x6000);
-    sir_debug_backend::ir_to_bytecode(&program, &mut bytecode);
+    let bytecode = driver.emit_bytecode(&mir, args.already_ssa, args.optimize.as_deref());
 
     print!("0x");
     for byte in bytecode {
