@@ -1,7 +1,4 @@
-use crate::{
-    BigNumInterner, BlockId, CallArgsId, ConstId, Expr, FnDefId, Hir, Instruction, LocalId,
-    StructDefId,
-};
+use crate::*;
 use plank_core::Idx;
 use plank_session::Session;
 use std::fmt::{self, Display, Formatter};
@@ -30,7 +27,11 @@ impl<'a> DisplayHir<'a> {
     }
 
     fn fmt_struct_ref(&self, f: &mut Formatter<'_>, struct_id: StructDefId) -> fmt::Result {
-        write!(f, "@struct{}", struct_id.get())
+        let r#struct = &self.hir.struct_defs[struct_id];
+        let (line, col) =
+            self.session.offset_to_line_col(r#struct.source_id, r#struct.source_span.start);
+        let source = self.session.get_source(r#struct.source_id);
+        write!(f, "struct#{} {}:{}:{}", struct_id.get(), source.path.to_str().unwrap(), line, col)
     }
 
     fn fmt_args(&self, f: &mut Formatter<'_>, args_id: CallArgsId) -> fmt::Result {
@@ -46,7 +47,8 @@ impl<'a> DisplayHir<'a> {
     }
 
     fn fmt_expr(&self, f: &mut Formatter<'_>, expr: Expr) -> fmt::Result {
-        match expr {
+        use ExprKind as Expr;
+        match expr.kind {
             Expr::ConstRef(id) => self.fmt_const_ref(f, id),
             Expr::LocalRef(id) => self.fmt_local(f, id),
             Expr::FnDef(id) => self.fmt_fn_ref(f, id),
@@ -90,41 +92,50 @@ impl<'a> DisplayHir<'a> {
         }
     }
 
-    fn fmt_instr(&self, f: &mut Formatter<'_>, instr: Instruction, indent: usize) -> fmt::Result {
+    fn fmt_instr(
+        &self,
+        f: &mut Formatter<'_>,
+        instr: InstructionKind,
+        indent: usize,
+    ) -> fmt::Result {
         let pad = "    ".repeat(indent);
         match instr {
-            Instruction::Set { local, expr } => {
+            InstructionKind::Set { local, r#type, expr } => {
                 write!(f, "{pad}")?;
                 self.fmt_local(f, local)?;
+                if let Some(r#type) = r#type {
+                    write!(f, " : ")?;
+                    self.fmt_local(f, r#type)?;
+                }
                 write!(f, " = ")?;
                 self.fmt_expr(f, expr)?;
                 writeln!(f)
             }
-            Instruction::Assign { target, value } => {
+            InstructionKind::BranchSet { local, expr } => {
+                write!(f, "{pad}")?;
+                self.fmt_local(f, local)?;
+                write!(f, " [br]= ")?;
+                self.fmt_expr(f, expr)?;
+                writeln!(f)
+            }
+            InstructionKind::Assign { target, value } => {
                 write!(f, "{pad}")?;
                 self.fmt_local(f, target)?;
                 write!(f, " := ")?;
                 self.fmt_expr(f, value)?;
                 writeln!(f)
             }
-            Instruction::AssertType { value, of_type } => {
-                write!(f, "{pad}assert_type ")?;
-                self.fmt_local(f, value)?;
-                write!(f, " : ")?;
-                self.fmt_local(f, of_type)?;
-                writeln!(f)
-            }
-            Instruction::Eval(expr) => {
+            InstructionKind::Eval(expr) => {
                 write!(f, "{pad}eval ")?;
                 self.fmt_expr(f, expr)?;
                 writeln!(f)
             }
-            Instruction::Return(expr) => {
+            InstructionKind::Return(expr) => {
                 write!(f, "{pad}ret ")?;
                 self.fmt_expr(f, expr)?;
                 writeln!(f)
             }
-            Instruction::If { condition, then_block, else_block } => {
+            InstructionKind::If { condition, then_block, else_block } => {
                 write!(f, "{pad}if ")?;
                 self.fmt_local(f, condition)?;
                 writeln!(f, " {{")?;
@@ -133,7 +144,7 @@ impl<'a> DisplayHir<'a> {
                 self.fmt_block(f, else_block, indent + 1)?;
                 writeln!(f, "{pad}}}")
             }
-            Instruction::While { condition_block, condition, body } => {
+            InstructionKind::While { condition_block, condition, body } => {
                 writeln!(f, "{pad}while {{")?;
                 writeln!(f, "{pad}    cond:")?;
                 self.fmt_block(f, condition_block, indent + 2)?;
@@ -150,7 +161,7 @@ impl<'a> DisplayHir<'a> {
     fn fmt_block(&self, f: &mut Formatter<'_>, block_id: BlockId, indent: usize) -> fmt::Result {
         let instructions = &self.hir.blocks[block_id];
         for &instr in instructions {
-            self.fmt_instr(f, instr, indent)?;
+            self.fmt_instr(f, instr.kind, indent)?;
         }
         Ok(())
     }

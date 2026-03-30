@@ -3,12 +3,11 @@ use std::cell::RefCell;
 use hashbrown::HashMap;
 use plank_core::{Idx, IncIterable, IndexVec, Span, list_of_lists::ListOfLists};
 use plank_parser::{
-    StrId,
     ast::{self, Statement, TopLevelDef},
     cst::NumLitId,
     lexer::{Lexed, TokenIdx},
 };
-use plank_session::{Builtin, Session, SourceId, SourceSpan, TypeId};
+use plank_session::{Builtin, Session, SourceId, SourceSpan, StrId, TypeId};
 use plank_source::project::{FileImport, ImportKind};
 use plank_values::BigNumInterner;
 
@@ -16,10 +15,7 @@ mod diagnostics;
 
 use plank_source::ParsedProject;
 
-use crate::{
-    BlockId, CallArgsId, CaptureInfo, ConstDef, ConstId, Expr, FieldInfo, FieldsId, FnDef, FnDefId,
-    Hir, Instruction, LocalId, ParamInfo, StructDef, StructDefId,
-};
+use crate::*;
 
 #[derive(Clone, Copy)]
 struct ScopedLocal {
@@ -195,10 +191,15 @@ impl BlockLowerer<'_> {
         self.next_local_id.get_and_inc()
     }
 
+    fn expr(&self, kind: ExprKind, span: Span<TokenIdx>) -> Expr {
+        Expr { source_id: self.source_id, kind, span: self.lexed.tokens_src_span(span) }
+    }
+
     fn lower_expr_to_local(&mut self, expr: ast::Expr<'_>) -> LocalId {
-        let value = self.lower_expr(expr);
+        let span = expr.span();
+        let expr = self.lower_expr(expr);
         let local = self.alloc_temp();
-        self.emit(Instruction::Set { local, expr: value });
+        self.emit(span, InstructionKind::Set { local, r#type: None, expr });
         local
     }
 
@@ -215,38 +216,53 @@ impl BlockLowerer<'_> {
     }
 
     fn lower_body_to_block(&mut self, block: ast::BlockExpr<'_>) -> BlockId {
-        self.create_sub_block(|lowerer| {
+        self.create_sub_block(|this| {
             for stmt in block.statements() {
-                lowerer.lower_statement(stmt);
+                this.lower_statement(stmt);
             }
             if let Some(e) = block.end_expr() {
-                let value = lowerer.lower_expr(e);
-                lowerer.emit(Instruction::Eval(value));
+                let span = e.span();
+                let value = this.lower_expr(e);
+                this.emit(span, InstructionKind::Eval(value));
             }
         })
     }
 
-    fn lower_body_to_block_with_result(
-        &mut self,
-        block: ast::BlockExpr<'_>,
-        result: LocalId,
-    ) -> BlockId {
-        self.create_sub_block(|lowerer| {
+    fn lower_branch_body(&mut self, block: ast::BlockExpr<'_>, result: LocalId) -> BlockId {
+        self.create_sub_block(|this| {
             for stmt in block.statements() {
-                lowerer.lower_statement(stmt);
+                this.lower_statement(stmt);
             }
-            let value = block.end_expr().map(|e| lowerer.lower_expr(e)).unwrap_or(Expr::Void);
-            lowerer.emit(Instruction::Set { local: result, expr: value });
+            let (span, expr) = match block.end_expr() {
+                Some(e) => {
+                    let span = e.span();
+                    (span, this.lower_expr(e))
+                }
+                None => {
+                    let span = block.node().span();
+                    (span, this.expr(ExprKind::Void, span))
+                }
+            };
+            this.emit(span, InstructionKind::BranchSet { local: result, expr });
         })
     }
 
     fn lower_fn_body_block(&mut self, block: ast::BlockExpr<'_>) -> BlockId {
-        self.create_sub_block(|lowerer| {
+        self.create_sub_block(|this| {
             for stmt in block.statements() {
-                lowerer.lower_statement(stmt);
+                this.lower_statement(stmt);
             }
-            let value = block.end_expr().map(|e| lowerer.lower_expr(e)).unwrap_or(Expr::Void);
-            lowerer.emit(Instruction::Return(value));
+            let (span, value) = match block.end_expr() {
+                Some(e) => {
+                    let span = e.span();
+                    (span, this.lower_expr(e))
+                }
+                None => {
+                    let span = block.node().span();
+                    (span, this.expr(ExprKind::Void, span))
+                }
+            };
+            this.emit(span, InstructionKind::Return(value));
         })
     }
 
@@ -273,61 +289,63 @@ impl BlockLowerer<'_> {
         Some(inner_local)
     }
 
-    fn emit(&mut self, instr: Instruction) {
-        self.instructions_buf.push(instr);
+    fn emit(&mut self, span: Span<TokenIdx>, kind: InstructionKind) {
+        let span = self.lexed.tokens_src_span(span);
+        self.instructions_buf.push(Instruction { loc: SrcLoc::new(self.source_id, span), kind });
     }
 
     fn flush_instructions_from(&mut self, start: usize) -> BlockId {
         self.builder.blocks.push_iter(self.instructions_buf.drain(start..))
     }
 
-    fn resolve_name(&mut self, name: StrId, span: Span<TokenIdx>) -> Expr {
+    fn resolve_name(&mut self, name: StrId, span: Span<TokenIdx>) -> ExprKind {
         if let Some(ty) = TypeId::resolve_primitive(name) {
-            return Expr::Type(ty);
+            return ExprKind::Type(ty);
         }
 
         if Builtin::from_str_id(name).is_some() {
             self.error_non_call_reference_to_builtin(name, span);
-            return Expr::Error;
+            return ExprKind::Error;
         }
 
         if let Some(entry) = self.find_local(name) {
-            return Expr::LocalRef(entry.id);
+            return ExprKind::LocalRef(entry.id);
         }
 
         if let Some(capture_local) = self.lookup_capture(name) {
-            return Expr::LocalRef(capture_local);
+            return ExprKind::LocalRef(capture_local);
         }
 
         if let Some(entry) = self.consts.get(&name) {
-            return Expr::ConstRef(entry.const_id);
+            return ExprKind::ConstRef(entry.const_id);
         }
 
         self.error_unresolved_identifier(name, span);
-        Expr::Error
+        ExprKind::Error
     }
 
     fn lower_expr(&mut self, expr: ast::Expr<'_>) -> Expr {
-        match expr {
+        let kind = match expr {
+            ast::Expr::Block(block) => return self.lower_scope(block),
+
             ast::Expr::Ident { name, span } => self.resolve_name(name, span),
-            ast::Expr::Block(block) => self.lower_scope(block),
-            ast::Expr::BoolLiteral(b) => Expr::Bool(b),
+            ast::Expr::BoolLiteral { value, .. } => ExprKind::Bool(value),
             ast::Expr::NumLiteral { negative, id, span } => {
                 let limbs = &self.num_lit_limbs[id];
                 match plank_core::bigint::limbs_to_u256(limbs, negative) {
                     Some(value) => {
                         let big_num_id = self.big_nums.intern(value);
-                        Expr::BigNum(big_num_id)
+                        ExprKind::BigNum(big_num_id)
                     }
                     None => {
                         self.error_number_out_of_range(span);
-                        Expr::Error
+                        ExprKind::Error
                     }
                 }
             }
             ast::Expr::Member(member_expr) => {
                 let object = self.lower_expr_to_local(member_expr.object());
-                Expr::Member { object, member: member_expr.member }
+                ExprKind::Member { object, member: member_expr.member }
             }
             ast::Expr::Call(call_expr) => {
                 let callee = call_expr.callee();
@@ -340,7 +358,7 @@ impl BlockLowerer<'_> {
                         self.locals_buf.push(local);
                     }
                     let args = self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..));
-                    Expr::BuiltinCall { builtin, args }
+                    ExprKind::BuiltinCall { builtin, args }
                 } else {
                     let callee = self.lower_expr_to_local(callee);
                     let buf_start = self.locals_buf.len();
@@ -349,7 +367,7 @@ impl BlockLowerer<'_> {
                         self.locals_buf.push(local);
                     }
                     let args = self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..));
-                    Expr::Call { callee, args }
+                    ExprKind::Call { callee, args }
                 }
             }
             ast::Expr::StructLit(struct_lit) => {
@@ -360,16 +378,19 @@ impl BlockLowerer<'_> {
                     self.field_buf.push(FieldInfo { name: field.name, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));
-                Expr::StructLit { ty, fields }
+                ExprKind::StructLit { ty, fields }
             }
             ast::Expr::StructDef(struct_def) => {
-                let source = struct_def.node().idx();
+                let source_id = self.source_id;
+                let span = struct_def.node().span();
+                let source_span = self.lexed.tokens_src_span(span);
                 let type_index = struct_def
                     .index_expr()
                     .map(|expr| self.lower_expr_to_local(expr))
                     .unwrap_or_else(|| {
                         let local = self.alloc_temp();
-                        self.emit(Instruction::Set { local, expr: Expr::Void });
+                        let expr = self.expr(ExprKind::Void, struct_def.node().span());
+                        self.emit(span, InstructionKind::Set { local, r#type: None, expr });
                         local
                     });
                 let buf_start = self.field_buf.len();
@@ -378,19 +399,29 @@ impl BlockLowerer<'_> {
                     self.field_buf.push(FieldInfo { name: field.name, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));
-                let struct_def_id =
-                    self.builder.struct_defs.push(StructDef { source, type_index, fields });
-                Expr::StructDef(struct_def_id)
+                let struct_def_id = self.builder.struct_defs.push(StructDef {
+                    source_id,
+                    source_span,
+                    type_index,
+                    fields,
+                });
+                ExprKind::StructDef(struct_def_id)
             }
-            ast::Expr::FnDef(fn_def) => Expr::FnDef(self.lower_fn_def(fn_def)),
+            ast::Expr::FnDef(fn_def) => ExprKind::FnDef(self.lower_fn_def(fn_def)),
             ast::Expr::If(if_expr) => {
                 let result = self.alloc_temp();
                 let condition = self.lower_expr_to_local(if_expr.condition());
-                let then_block = self.lower_body_to_block_with_result(if_expr.body(), result);
-                let else_block =
-                    self.lower_else_chain(result, if_expr.else_if_branches(), if_expr.else_body());
-                self.emit(Instruction::If { condition, then_block, else_block });
-                Expr::LocalRef(result)
+                let then_block = self.lower_branch_body(if_expr.body(), result);
+                let else_block = self.lower_else_chain(
+                    result,
+                    if_expr.else_if_branches(),
+                    if_expr.else_body().ok_or_else(|| if_expr.body().node().span()),
+                );
+                self.emit(
+                    if_expr.node().span(),
+                    InstructionKind::If { condition, then_block, else_block },
+                );
+                ExprKind::LocalRef(result)
             }
             ast::Expr::ComptimeBlock(_) => {
                 todo!("comptime block lowering requires extra HIR instructions")
@@ -401,7 +432,8 @@ impl BlockLowerer<'_> {
             ast::Expr::Unary(unary) => {
                 panic!("unary expression lowering not yet implemented (op: {:?})", unary.op)
             }
-        }
+        };
+        self.expr(kind, expr.span())
     }
 
     fn add_param_to_scope_as_local(&mut self, param: ast::Param<'_>) -> LocalId {
@@ -430,14 +462,20 @@ impl BlockLowerer<'_> {
         };
 
         let body = self.lower_fn_body_block(fn_def.body());
-        let fn_def_id = self.builder.fns.push(FnDef { type_preamble, body, return_type });
+        let fn_def_id = self.builder.fns.push(FnDef {
+            type_preamble,
+            body,
+            return_type,
+            source: self.source_id,
+        });
 
         let (type_value_pairs, []) = self.locals_buf[param_locals_start..].as_chunks() else {
             unreachable!("not only pairs?")
         };
         let fn_params_id = self.builder.fn_params.push_iter(
             type_value_pairs.iter().zip(fn_def.params()).map(|(&[r#type, value], param)| {
-                ParamInfo { is_comptime: param.is_comptime, value, r#type }
+                let span = self.lexed.tokens_src_span(param.node().span());
+                ParamInfo { is_comptime: param.is_comptime, value, r#type, span }
             }),
         );
         self.locals_buf.truncate(param_locals_start);
@@ -462,14 +500,14 @@ impl BlockLowerer<'_> {
     }
 
     fn lower_scope(&mut self, block: ast::BlockExpr<'_>) -> Expr {
-        self.scoped(|lowerer| {
+        self.scoped(|this| {
             for stmt in block.statements() {
-                lowerer.lower_statement(stmt);
+                this.lower_statement(stmt);
             }
 
             match block.end_expr() {
-                Some(expr) => lowerer.lower_expr(expr),
-                None => Expr::Void,
+                Some(expr) => this.lower_expr(expr),
+                None => this.expr(ExprKind::Void, block.node().span()),
             }
         })
     }
@@ -478,45 +516,49 @@ impl BlockLowerer<'_> {
         &mut self,
         result: LocalId,
         mut branches: impl Iterator<Item = ast::ElseIfBranch<'cst>>,
-        else_body: Option<ast::BlockExpr<'cst>>,
+        else_body: Result<ast::BlockExpr<'cst>, Span<TokenIdx>>,
     ) -> BlockId {
         if let Some(first) = branches.next() {
-            self.create_sub_block(|lowerer| {
-                let condition = lowerer.lower_expr_to_local(first.condition());
-                let then_block = lowerer.lower_body_to_block_with_result(first.body(), result);
-                let else_block = lowerer.lower_else_chain(result, branches, else_body);
-                lowerer.emit(Instruction::If { condition, then_block, else_block });
-            })
-        } else if let Some(body) = else_body {
-            self.lower_body_to_block_with_result(body, result)
-        } else {
-            self.create_sub_block(|lowerer| {
-                lowerer.emit(Instruction::Set { local: result, expr: Expr::Void });
-            })
+            return self.create_sub_block(|this| {
+                let span = first.node().span();
+                let condition = this.lower_expr_to_local(first.condition());
+                let then_block = this.lower_branch_body(first.body(), result);
+                let else_body = else_body.map_err(|_| first.body().node().span());
+                let else_block = this.lower_else_chain(result, branches, else_body);
+                this.emit(span, InstructionKind::If { condition, then_block, else_block });
+            });
+        }
+        match else_body {
+            Ok(body) => self.lower_branch_body(body, result),
+            Err(empty_else_span) => self.create_sub_block(|this| {
+                let expr = this.expr(ExprKind::Void, empty_else_span);
+                this.emit(empty_else_span, InstructionKind::BranchSet { local: result, expr });
+            }),
         }
     }
 
     fn lower_statement(&mut self, stmt: Statement<'_>) {
         match stmt {
             Statement::Let(let_stmt) => {
-                let type_local = let_stmt.type_expr().map(|t| self.lower_expr_to_local(t));
-                let value = self.lower_expr(let_stmt.value());
-                let local_id =
-                    self.alloc_local(let_stmt.name, let_stmt.mutable, let_stmt.name_span);
-                self.emit(Instruction::Set { local: local_id, expr: value });
-                if let Some(type_local) = type_local {
-                    self.emit(Instruction::AssertType { value: local_id, of_type: type_local });
-                }
+                let expr = self.lower_expr(let_stmt.value());
+                // Local allocated *after* to ensure it's not visible to `lower_expr`.
+                let local = self.alloc_local(let_stmt.name, let_stmt.mutable, let_stmt.name_span);
+                let r#type =
+                    let_stmt.type_expr().map(|type_expr| self.lower_expr_to_local(type_expr));
+                self.emit(let_stmt.value().span(), InstructionKind::Set { local, r#type, expr });
             }
             Statement::Expr(expr) => {
+                let span = expr.span();
                 let value = self.lower_expr(expr);
-                self.emit(Instruction::Eval(value));
+                self.emit(span, InstructionKind::Eval(value));
             }
             Statement::Return(return_stmt) => {
+                let span = return_stmt.node().span();
                 let value = self.lower_expr(return_stmt.value());
-                self.emit(Instruction::Return(value));
+                self.emit(span, InstructionKind::Return(value));
             }
             Statement::Assign(assign_stmt) => {
+                let stmt_span = assign_stmt.node().span();
                 let ast::Expr::Ident { name, span } = assign_stmt.target() else {
                     panic!("complex assignment targets not yet supported")
                 };
@@ -534,18 +576,18 @@ impl BlockLowerer<'_> {
                 }
                 let target = entry.id;
                 let value = self.lower_expr(assign_stmt.value());
-                self.emit(Instruction::Assign { target, value });
+                self.emit(stmt_span, InstructionKind::Assign { target, value });
             }
             Statement::While(while_stmt) => {
+                let span = while_stmt.node().span();
                 if while_stmt.inline {
-                    self.error_not_yet_implemented("inline while", while_stmt.node().span());
+                    self.error_not_yet_implemented("inline while", span);
                     return;
                 }
-                let (condition_block, condition) = self.create_sub_block_with(|lowerer| {
-                    lowerer.lower_expr_to_local(while_stmt.condition())
-                });
+                let (condition_block, condition) = self
+                    .create_sub_block_with(|this| this.lower_expr_to_local(while_stmt.condition()));
                 let body = self.lower_body_to_block(while_stmt.body());
-                self.emit(Instruction::While { condition_block, condition, body });
+                self.emit(span, InstructionKind::While { condition_block, condition, body });
             }
         }
     }
@@ -594,19 +636,14 @@ pub fn lower(project: &ParsedProject, big_nums: &mut BigNumInterner, session: &m
                     let hir_def = &mut consts[id];
                     hir_def.result =
                         lowerer.alloc_local(const_def.name, false, const_def.name_span());
-                    hir_def.body = lowerer.create_sub_block(|l| {
-                        if let Some(type_expr) = const_def.r#type {
-                            let type_local = l.lower_expr_to_local(type_expr);
-                            let assign = l.lower_expr(const_def.assign);
-                            l.emit(Instruction::Set { local: hir_def.result, expr: assign });
-                            l.emit(Instruction::AssertType {
-                                value: hir_def.result,
-                                of_type: type_local,
-                            });
-                        } else {
-                            let assign = l.lower_expr(const_def.assign);
-                            l.emit(Instruction::Set { local: hir_def.result, expr: assign });
-                        }
+                    hir_def.body = lowerer.create_sub_block(|this| {
+                        let r#type =
+                            const_def.r#type.map(|type_expr| this.lower_expr_to_local(type_expr));
+                        let expr = this.lower_expr(const_def.assign);
+                        this.emit(
+                            const_def.assign.span(),
+                            InstructionKind::Set { local: hir_def.result, r#type, expr },
+                        );
                     });
                 }
                 TopLevelDef::Init(init_def) => {

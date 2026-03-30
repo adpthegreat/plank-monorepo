@@ -3,7 +3,7 @@ pub mod diagnostic;
 pub mod types;
 
 pub use builtins::Builtin;
-pub use diagnostic::{AnnotationKind, Annotations, Claim, Diagnostic, Element, Level};
+pub use diagnostic::{AnnotationKind, Annotations, Claim, Diagnostic, Element, Level, SrcLoc};
 pub use types::TypeId;
 
 use plank_core::{Idx, IndexVec, Span, intern::StringInterner, newtype_index};
@@ -79,6 +79,26 @@ impl Session {
 
     pub fn interner(&self) -> &plank_core::intern::StringInterner<StrId> {
         &self.name_interner
+    }
+
+    /// Both line and col are 1-indexed. O(n) linear scan.
+    pub fn offset_to_line_col(&self, source_id: SourceId, offset: SourceByteOffset) -> (u32, u32) {
+        let source = self.get_source(source_id);
+        let byte_offset = offset.idx();
+        let mut line: u32 = 1;
+        let mut col: u32 = 1;
+        for (i, ch) in source.content.char_indices() {
+            if i >= byte_offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
     }
 }
 

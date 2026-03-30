@@ -17,6 +17,7 @@ fn try_lower_project(project: TestProject) -> (Hir, BigNumInterner, Session, Par
     (hir, big_nums, session, project)
 }
 
+#[track_caller]
 fn assert_lowers_to(source: &str, expected: &str) {
     let (hir, big_nums, session, _project) = try_lower(source);
     assert!(
@@ -62,15 +63,14 @@ fn test_basic_init_builtin_calls() {
         ==== Init ====
         %0 = 0
         %1 = calldataload(%0)
-        %2 = type#1
-        %3 = 32
-        %4 = calldataload(%3)
-        assert_type %4 : %2
+        %2 = 32
+        %4 = type#1
+        %3 : %4 = calldataload(%2)
         %5 = 32
         %6 = malloc_uninit(%5)
         %7 = %6
         %8 = %1
-        %9 = %4
+        %9 = %3
         %10 = add(%8, %9)
         eval mstore32(%7, %10)
         %11 = %6
@@ -203,7 +203,7 @@ fn test_fn_struct_return() {
             %1 = void
             %2 = type#1
             %3 = type#1
-            %0 = @struct0
+            %0 = struct#0 main.plk:1:14
         }
         ConstId(1) ("swap") result=LocalId(0) {
             %0 = @fn0

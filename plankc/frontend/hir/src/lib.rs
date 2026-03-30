@@ -1,6 +1,5 @@
 use plank_core::{IndexVec, list_of_lists::ListOfLists, newtype_index};
-use plank_parser::{StrId, cst::NodeIdx};
-use plank_session::{Builtin, SourceId, SourceSpan, TypeId};
+use plank_session::{Builtin, SourceId, SourceSpan, SrcLoc, StrId, TypeId};
 
 pub use plank_values;
 
@@ -21,7 +20,20 @@ newtype_index! {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Expr {
+pub struct Expr {
+    pub source_id: SourceId,
+    pub span: SourceSpan,
+    pub kind: ExprKind,
+}
+
+impl Expr {
+    pub fn src_loc(&self) -> SrcLoc {
+        SrcLoc::new(self.source_id, self.span)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExprKind {
     ConstRef(ConstId),
     LocalRef(LocalId),
     FnDef(FnDefId),
@@ -31,20 +43,34 @@ pub enum Expr {
     BigNum(BigNumId),
     Type(TypeId),
 
-    Call { callee: LocalId, args: CallArgsId },
-    BuiltinCall { builtin: Builtin, args: CallArgsId },
-    Member { object: LocalId, member: StrId },
-    StructLit { ty: LocalId, fields: FieldsId },
+    Call {
+        callee: LocalId,
+        args: CallArgsId,
+    },
+    BuiltinCall {
+        builtin: Builtin,
+        args: CallArgsId,
+    },
+    Member {
+        object: LocalId,
+        member: StrId,
+    },
+    StructLit {
+        ty: LocalId,
+        fields: FieldsId,
+    },
     StructDef(StructDefId),
 
+    /// Indicates the expr that evaluated to the value had some error that was already handled,
+    /// to avoid cascades any expression downstream from it also needs to become an error.
     Error,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Instruction {
-    Set { local: LocalId, expr: Expr },
+pub enum InstructionKind {
+    Set { local: LocalId, r#type: Option<LocalId>, expr: Expr },
+    BranchSet { local: LocalId, expr: Expr },
     Assign { target: LocalId, value: Expr },
-    AssertType { value: LocalId, of_type: LocalId },
     Eval(Expr),
     Return(Expr),
     If { condition: LocalId, then_block: BlockId, else_block: BlockId },
@@ -52,10 +78,17 @@ pub enum Instruction {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct Instruction {
+    pub loc: SrcLoc,
+    pub kind: InstructionKind,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ParamInfo {
     pub is_comptime: bool,
     pub value: LocalId,
     pub r#type: LocalId,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,11 +111,13 @@ pub struct FnDef {
     pub body: BlockId,
     /// Preamble set local that holds the return type expression.
     pub return_type: LocalId,
+    pub source: SourceId,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct StructDef {
-    pub source: NodeIdx,
+    pub source_id: SourceId,
+    pub source_span: SourceSpan,
     pub type_index: LocalId,
     pub fields: FieldsId,
 }

@@ -25,9 +25,6 @@ struct Args {
     #[arg(short = 'O', long = "optimize", help = OPTIMIZE_HELP, value_parser = parse_optimizations_string)]
     optimize: Option<String>,
 
-    #[arg(long = "already-ssa")]
-    already_ssa: bool,
-
     #[arg(long = "module-name")]
     module_name: Option<String>,
 
@@ -96,14 +93,14 @@ fn main() {
     let mir = driver.evaluate_hir(&hir);
 
     if args.show_mir {
-        print!("{}", DisplayMir::new(&mir, &driver.big_nums));
+        print!("{}", DisplayMir::new(&mir, &driver.big_nums, &driver.session));
     }
 
     if driver.session.has_errors() {
         driver.render_diagnostics_and_exit();
     }
 
-    let bytecode = driver.emit_bytecode(&mir, args.already_ssa, args.optimize.as_deref());
+    let bytecode = driver.emit_bytecode(&mir, args.optimize.as_deref());
 
     print!("0x");
     for byte in bytecode {

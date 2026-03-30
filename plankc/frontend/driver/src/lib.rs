@@ -46,23 +46,14 @@ impl<'a, F: SourceFs> Driver<'a, F> {
         lower(project, &mut self.big_nums, &mut self.session)
     }
 
-    pub fn evaluate_hir(&self, hir: &plank_hir::Hir) -> plank_mir::Mir {
-        plank_hir_eval::evaluate(hir)
+    pub fn evaluate_hir(&mut self, hir: &plank_hir::Hir) -> plank_mir::Mir {
+        plank_hir_eval::evaluate(hir, &mut self.session)
     }
 
-    pub fn emit_bytecode(
-        &self,
-        mir: &plank_mir::Mir,
-        already_ssa: bool,
-        optimizations: Option<&str>,
-    ) -> Vec<u8> {
+    pub fn emit_bytecode(&self, mir: &plank_mir::Mir, optimizations: Option<&str>) -> Vec<u8> {
         let mut program = plank_mir_lower::lower(mir, &self.big_nums);
         let mut pass_manager = PassManager::new(&mut program);
-        if already_ssa {
-            pass_manager.run_legalize().expect("illegal IR pre-ssa");
-        } else {
-            pass_manager.run_ssa_transform();
-        }
+        pass_manager.run_ssa_transform();
         if let Some(passes) = optimizations {
             pass_manager.run_optimizations(passes);
         }

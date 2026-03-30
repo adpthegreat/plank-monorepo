@@ -1,11 +1,12 @@
 use hashbrown::HashSet;
+use plank_core::{DenseIndexMap, LoopLimit};
 use sir_data::{BasicBlockId, DenseIndexSet, EthIRProgram, IndexVec, index_vec};
 
 use crate::analyses::{AnalysesStore, Predecessors, cache::Analysis};
 
 #[derive(Default)]
 pub struct Dominators {
-    inner: IndexVec<BasicBlockId, Option<BasicBlockId>>,
+    inner: DenseIndexMap<BasicBlockId, BasicBlockId>,
 }
 
 impl Analysis for Dominators {
@@ -13,7 +14,6 @@ impl Analysis for Dominators {
     fn compute(&mut self, program: &EthIRProgram, store: &AnalysesStore) {
         let predecessors = store.predecessors(program);
         self.inner.clear();
-        self.inner.resize(program.basic_blocks.len(), None);
         for func in program.functions_iter() {
             compute_function_dominators(program, func.entry().id(), &predecessors, &mut self.inner);
         }
@@ -22,19 +22,7 @@ impl Analysis for Dominators {
 
 impl Dominators {
     pub fn of(&self, bb: BasicBlockId) -> Option<BasicBlockId> {
-        self.inner[bb]
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn enumerate(&self) -> impl Iterator<Item = (BasicBlockId, Option<BasicBlockId>)> + '_ {
-        self.inner.enumerate_idx().map(|(bb, &dominator)| (bb, dominator))
+        self.inner.get(bb).copied()
     }
 }
 
@@ -50,7 +38,7 @@ impl Analysis for DominanceFrontiers {
         for set in self.inner.iter_mut() {
             set.clear();
         }
-        self.inner.resize_with(dominators.len(), HashSet::new);
+        self.inner.resize_with(program.basic_blocks.len(), HashSet::new);
 
         for (b, preds) in predecessors.enumerate() {
             if preds.len() < 2 {
@@ -64,7 +52,9 @@ impl Analysis for DominanceFrontiers {
                     continue;
                 }
                 let mut runner = p;
+                let mut limit = LoopLimit::new();
                 while runner != idom {
+                    limit.tick();
                     self.inner[runner].insert(b);
                     runner = dominators.of(runner).expect("reachable path");
                 }
@@ -83,9 +73,9 @@ fn compute_function_dominators(
     program: &EthIRProgram,
     entry: BasicBlockId,
     predecessors: &Predecessors,
-    dominators: &mut IndexVec<BasicBlockId, Option<BasicBlockId>>,
+    dominators: &mut DenseIndexMap<BasicBlockId, BasicBlockId>,
 ) {
-    dominators[entry] = Some(entry);
+    assert!(dominators.insert(entry, entry).is_none());
 
     let mut visited = DenseIndexSet::new();
     let mut reverse_post_order = Vec::new();
@@ -97,21 +87,21 @@ fn compute_function_dominators(
     }
 
     let mut changed = true;
+    let mut limit = LoopLimit::new();
     while changed {
+        limit.tick();
         changed = false;
-        for bb in reverse_post_order[1..].iter() {
-            let preds = predecessors.of(*bb);
-            debug_assert!(!preds.is_empty(), "non-entry block in RPO has no predecessors");
-            let mut new_idom = preds[0];
-            for pred in preds[1..].iter() {
-                if dominators[*pred].is_some() {
-                    new_idom = intersect(*pred, new_idom, dominators, &bb_to_rpo_pos);
+        for &bb in reverse_post_order[1..].iter() {
+            let mut preds =
+                predecessors.of(bb).iter().copied().filter(|&pred| dominators.contains(pred));
+            let mut new_idom = preds.next().expect("non-entry block in RPO has no predecessors");
+            for pred in preds {
+                if dominators.contains(pred) {
+                    new_idom = intersect(pred, new_idom, dominators, &bb_to_rpo_pos);
                 }
             }
-            if dominators[*bb] != Some(new_idom) {
-                dominators[*bb] = Some(new_idom);
-                changed = true;
-            }
+            changed |=
+                dominators.insert(bb, new_idom).is_none_or(|prev_idom| prev_idom != new_idom);
         }
     }
 }
@@ -119,21 +109,24 @@ fn compute_function_dominators(
 fn intersect(
     bb1: BasicBlockId,
     bb2: BasicBlockId,
-    dominators: &IndexVec<BasicBlockId, Option<BasicBlockId>>,
+    dominators: &DenseIndexMap<BasicBlockId, BasicBlockId>,
     bb_to_rpo_pos: &IndexVec<BasicBlockId, u32>,
 ) -> BasicBlockId {
     let mut finger1 = bb1;
     let mut finger2 = bb2;
+    let mut limit = LoopLimit::new();
     while finger1 != finger2 {
+        limit.tick();
         while bb_to_rpo_pos[finger1] > bb_to_rpo_pos[finger2] {
-            finger1 = dominators[finger1]
-                .expect("intersect only called on blocks with computed dominators");
+            limit.tick();
+            finger1 = dominators[finger1];
         }
         while bb_to_rpo_pos[finger2] > bb_to_rpo_pos[finger1] {
-            finger2 = dominators[finger2]
-                .expect("intersect only called on blocks with computed dominators");
+            limit.tick();
+            finger2 = dominators[finger2];
         }
     }
+
     finger1
 }
 
@@ -551,5 +544,50 @@ mod tests {
         assert_eq!(frontier_to_vec(df.of(bb(1))), vec![bb(2), bb(3)]); // DF(B) = {C, D}
         assert_eq!(frontier_to_vec(df.of(bb(2))), vec![bb(1), bb(3)]); // DF(C) = {B, D}
         assert_eq!(frontier_to_vec(df.of(bb(3))), vec![]); // DF(D) = {}
+    }
+
+    #[test]
+    fn test_unreachable_predecessor() {
+        //   entry → B → D (stop)
+        //           |   ↑
+        //           +→C-+
+        //               ↑
+        //   orphan ─────+ (unreachable)
+        //
+        // orphan is listed before B and C so it becomes preds[0] for D.
+        // Regression test: the old algorithm unconditionally used preds[0] as
+        // the initial idom candidate. When preds[0] was unreachable (no
+        // computed dominator, RPO position 0), intersect would loop forever
+        // comparing two blocks at the same RPO position.
+        let program = sir_parser::parse_without_legalization(
+            r#"
+            fn init:
+                entry {
+                    => @b
+                }
+                orphan {
+                    => @d
+                }
+                b {
+                    x = const 1
+                    => x ? @c : @d
+                }
+                c {
+                    => @d
+                }
+                d {
+                    stop
+                }
+            "#,
+            EmitConfig::init_only(),
+        );
+
+        let store = crate::AnalysesStore::default();
+        let dominators = store.dominators(&program);
+        assert_eq!(dominators.of(bb(0)), Some(bb(0))); // idom(entry) = entry
+        assert_eq!(dominators.of(bb(2)), Some(bb(0))); // idom(B) = entry
+        assert_eq!(dominators.of(bb(3)), Some(bb(2))); // idom(C) = B
+        assert_eq!(dominators.of(bb(4)), Some(bb(2))); // idom(D) = B
+        assert_eq!(dominators.of(bb(1)), None); // orphan is unreachable
     }
 }
