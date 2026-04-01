@@ -274,7 +274,7 @@ impl BlockLowerer<'_> {
         Self::find_in_scope(&self.scoped_locals_stack[self.fn_scope_start..], name)
     }
 
-    fn lookup_capture(&mut self, name: StrId) -> Option<LocalId> {
+    fn lookup_capture(&mut self, name: StrId, use_span: Span<TokenIdx>) -> Option<LocalId> {
         let outer_local =
             Self::find_in_scope(&self.scoped_locals_stack[..self.fn_scope_start], name)?.id;
 
@@ -284,8 +284,9 @@ impl BlockLowerer<'_> {
             }
         }
 
+        let use_span = self.lexed.tokens_src_span(use_span);
         let inner_local = self.alloc_anonymous_local(name);
-        self.captures_buf.push(CaptureInfo { outer_local, inner_local });
+        self.captures_buf.push(CaptureInfo { outer_local, inner_local, use_span });
         Some(inner_local)
     }
 
@@ -312,7 +313,7 @@ impl BlockLowerer<'_> {
             return ExprKind::LocalRef(entry.id);
         }
 
-        if let Some(capture_local) = self.lookup_capture(name) {
+        if let Some(capture_local) = self.lookup_capture(name, span) {
             return ExprKind::LocalRef(capture_local);
         }
 
@@ -462,11 +463,14 @@ impl BlockLowerer<'_> {
         };
 
         let body = self.lower_fn_body_block(fn_def.body());
+        let param_list = fn_def.node().child(0).expect("FnDef missing ParamList");
+        let param_list_span = self.lexed.tokens_src_span(param_list.span());
         let fn_def_id = self.builder.fns.push(FnDef {
             type_preamble,
             body,
             return_type,
             source: self.source_id,
+            param_list_span,
         });
 
         let (type_value_pairs, []) = self.locals_buf[param_locals_start..].as_chunks() else {
@@ -641,7 +645,7 @@ pub fn lower(project: &ParsedProject, big_nums: &mut BigNumInterner, session: &m
                             const_def.r#type.map(|type_expr| this.lower_expr_to_local(type_expr));
                         let expr = this.lower_expr(const_def.assign);
                         this.emit(
-                            const_def.assign.span(),
+                            const_def.span(),
                             InstructionKind::Set { local: hir_def.result, r#type, expr },
                         );
                     });

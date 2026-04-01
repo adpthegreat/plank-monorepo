@@ -245,6 +245,11 @@ impl<'a> Parser<'a> {
         UnfinishedNode { idx, last_child: None }
     }
 
+    fn skip_trivia_start(&mut self) -> TokenIdx {
+        self.skip_trivia();
+        self.tokens.current()
+    }
+
     fn alloc_node(&mut self, kind: NodeKind) -> UnfinishedNode {
         let idx = self.nodes.push(Node {
             kind,
@@ -594,7 +599,7 @@ impl<'a> Parser<'a> {
         mode: ParseExprMode,
         min_bp: OpPriority,
     ) -> Option<NodeIdx> {
-        let start = self.tokens.current();
+        let start = self.skip_trivia_start();
 
         let mut expr = if let Some(((), rhs, kind)) = self.eat_unary() {
             let mut unary = self.alloc_node_from(start, NodeKind::UnaryExpr(kind));

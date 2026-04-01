@@ -36,6 +36,11 @@ enum ExprResult {
     ComptimeOnly(ValueId),
 }
 
+impl ExprResult {
+    const ERROR: Self =
+        Self::Runtime { expr: mir::Expr::Error, ty: TypeId::ERROR, comptime: Some(ValueId::ERROR) };
+}
+
 struct BlockControlFlowDiverges;
 
 impl FunctionLowerScope {
@@ -86,7 +91,8 @@ impl FunctionLowerScope {
     ) -> ExprResult {
         let ty_loc = self.locals.def_loc(ty);
         let Some(ty) = self.locals.comptime(ty) else {
-            todo!("diagnostic: struct type not comptime known");
+            eval.emit_struct_type_not_comptime(ty_loc);
+            return ExprResult::ERROR;
         };
         let Value::Type(ty) = eval.values.lookup(ty) else {
             eval.emit_type_constraint_not_type(eval.values.type_of_value(ty), ty_loc);
@@ -190,7 +196,7 @@ impl FunctionLowerScope {
                 let args = &eval.hir.call_args[args];
                 'sig: for &(input_types, result_type) in builtin.signatures() {
                     if input_types.len() != args.len() {
-                        todo!("diagnostic: builtin argument count mismatch");
+                        continue 'sig;
                     }
 
                     for (&input, &arg) in input_types.iter().zip(args) {
@@ -208,7 +214,16 @@ impl FunctionLowerScope {
                         comptime: None,
                     };
                 }
-                todo!("diagnostic: no matching builtin type signature")
+                for arg in args {
+                    self.field_types_buf.push(self.locals.get_type(*arg, &eval.values));
+                }
+                eval.emit_no_matching_builtin_signature(
+                    builtin,
+                    &self.field_types_buf,
+                    expr.src_loc(),
+                );
+                self.field_types_buf.clear();
+                ExprResult::ERROR
             }
             hir::ExprKind::LocalRef(hir) => {
                 let value = self.locals.comptime(hir);
@@ -235,10 +250,14 @@ impl FunctionLowerScope {
                 let captures = &eval.hir.fn_captures[fn_def];
                 assert!(self.captures_buf.is_empty());
                 for capture in captures {
-                    let vid = self
-                        .locals
-                        .comptime(capture.outer_local)
-                        .expect("todo-diagnostic: closure capture must be comptime");
+                    let vid = self.locals.comptime(capture.outer_local).unwrap_or_else(|| {
+                        let use_loc = SrcLoc::new(expr.source_id, capture.use_span);
+                        eval.emit_closure_capture_not_comptime(
+                            use_loc,
+                            self.locals.def_loc(capture.outer_local),
+                        );
+                        ValueId::ERROR
+                    });
                     let loc = self.locals.def_loc(capture.outer_local);
                     self.captures_buf.push((vid, loc));
                 }
@@ -249,20 +268,36 @@ impl FunctionLowerScope {
             }
             hir::ExprKind::Call { callee, args } => {
                 let callee_loc = self.locals.def_loc(callee);
-                let closure = self
-                    .locals
-                    .comptime(callee)
-                    .expect("todo-diagnostic: call target must be comptime-known");
+                let Some(closure) = self.locals.comptime(callee) else {
+                    eval.emit_call_target_not_comptime(callee_loc);
+                    return ExprResult::ERROR;
+                };
+                let Value::Closure { fn_def: hir_fn_def_id, .. } = eval.values.lookup(closure)
+                else {
+                    eval.emit_not_callable(eval.values.type_of_value(closure), callee_loc);
+                    return ExprResult::ERROR;
+                };
                 let callee = eval.fn_cache.get(&closure).copied().unwrap_or_else(|| {
-                    let id = self.lower_closure(eval, closure, callee_loc);
+                    let id = self.lower_closure(eval, closure);
                     eval.fn_cache.insert(closure, id);
                     id
                 });
 
                 let fn_def = eval.mir_fns[callee];
+                if fn_def.is_error() {
+                    return ExprResult::ERROR;
+                }
                 let arg_locals = &eval.hir.call_args[args];
                 if arg_locals.len() != fn_def.param_count as usize {
-                    todo!("diagnostic: function call argument count mismatch");
+                    let hir_fn_def = eval.hir.fns[hir_fn_def_id];
+                    let def_loc = SrcLoc::new(hir_fn_def.source, hir_fn_def.param_list_span);
+                    eval.emit_arg_count_mismatch(
+                        fn_def.param_count as usize,
+                        arg_locals.len(),
+                        expr.src_loc(),
+                        def_loc,
+                    );
+                    return ExprResult::ERROR;
                 }
 
                 for (arg_i, &arg_local) in arg_locals.iter().enumerate() {
@@ -358,15 +393,9 @@ impl FunctionLowerScope {
         }
     }
 
-    fn lower_closure(
-        &mut self,
-        eval: &mut Evaluator<'_>,
-        closure: ValueId,
-        callee_loc: SrcLoc,
-    ) -> mir::FnId {
+    fn lower_closure(&mut self, eval: &mut Evaluator<'_>, closure: ValueId) -> mir::FnId {
         let Value::Closure { fn_def, captures } = eval.values.lookup(closure) else {
-            eval.emit_not_callable(eval.values.type_of_value(closure), callee_loc);
-            todo!("diagnostic: callee is not a function — error recovery")
+            unreachable!("caller checks for Closure before calling lower_closure")
         };
         let func = eval.hir.fns[fn_def];
         let params = &eval.hir.fn_params[fn_def];
@@ -382,17 +411,18 @@ impl FunctionLowerScope {
             assert!(prev.is_none(), "invalid hir");
             self.locals.set_comptime_only(capture_info.inner_local, value, loc);
         }
-        // Interpret type premable to determine types.
+        // Interpret type preamble to determine types.
         self.interpreter
             .interpret_block(eval, func.type_preamble)
-            .expect("invalid hir: premable with `return`");
+            .expect("invalid hir: preamble with `return`");
         let (return_type, return_type_loc) = self.interpreter.bindings[func.return_type];
         let Value::Type(return_type) = eval.values.lookup(return_type) else {
             eval.emit_type_constraint_not_type(
                 eval.values.type_of_value(return_type),
                 return_type_loc,
             );
-            todo!("diagnostic: return type not type — error recovery")
+            self.locals = saved_locals;
+            return eval.push_error_fn();
         };
         let saved_return_type = std::mem::replace(&mut self.expected_return_type, return_type);
         let saved_return_type_loc = self.expected_return_type_loc.replace(return_type_loc);
@@ -446,10 +476,11 @@ impl FunctionLowerScope {
         for &instr in &eval.hir.blocks[block] {
             match instr.kind {
                 hir::InstructionKind::Set { local, r#type, expr } => {
-                    let src_loc = expr.src_loc();
+                    let def_loc = instr.loc;
+                    let expr_loc = expr.src_loc();
                     let ty = match self.translate_expr(eval, expr) {
                         ExprResult::Runtime { expr, ty, comptime } => {
-                            match self.locals.set(local, ty, src_loc, comptime) {
+                            match self.locals.set(local, ty, expr_loc, comptime) {
                                 Ok(target) => {
                                     self.instr_buf_stack
                                         .push(mir::Instruction::Set { target, expr });
@@ -459,14 +490,14 @@ impl FunctionLowerScope {
                                         expected_ty,
                                         self.locals.def_loc(local),
                                         received_ty,
-                                        src_loc,
+                                        expr_loc,
                                     );
                                 }
                             }
                             ty
                         }
                         ExprResult::ComptimeOnly(value) => {
-                            self.locals.set_comptime_only(local, value, src_loc);
+                            self.locals.set_comptime_only(local, value, def_loc);
                             eval.values.type_of_value(value)
                         }
                     };
@@ -478,7 +509,7 @@ impl FunctionLowerScope {
                                 expected,
                                 self.locals.def_loc(r#type),
                                 ty,
-                                src_loc,
+                                expr_loc,
                             );
                         }
                     }

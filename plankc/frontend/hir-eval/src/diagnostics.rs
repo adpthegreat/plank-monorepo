@@ -1,5 +1,8 @@
 use crate::Evaluator;
-use plank_session::{builtins::builtin_names, *};
+use plank_session::{
+    builtins::{Builtin, builtin_names},
+    *,
+};
 
 impl Evaluator<'_> {
     pub fn emit_type_mismatch_error(
@@ -9,33 +12,24 @@ impl Evaluator<'_> {
         actual_ty: TypeId,
         actual_loc: SrcLoc,
     ) {
-        let source = {
-            assert_eq!(expected_loc.source, actual_loc.source);
-            expected_loc.source
-        };
-        let diagnostic = Diagnostic::error("mismatched types").element(
-            Annotations::new(source)
-                .primary(
-                    actual_loc.span,
-                    format!(
-                        "expected `{}`, got `{}`",
-                        self.types.format(self.session, expected_ty),
-                        self.types.format(self.session, actual_ty),
-                    ),
-                )
-                .secondary(
-                    expected_loc.span,
-                    format!(
-                        "`{}` expected because of this",
-                        self.types.format(self.session, expected_ty),
-                    ),
-                ),
+        let primary_label = format!(
+            "expected `{}`, got `{}`",
+            self.types.format(self.session, expected_ty),
+            self.types.format(self.session, actual_ty),
+        );
+        let secondary_label =
+            format!("`{}` expected because of this", self.types.format(self.session, expected_ty),);
+        let diagnostic = Diagnostic::error("mismatched types").cross_source_annotations(
+            actual_loc,
+            primary_label,
+            expected_loc,
+            secondary_label,
         );
         self.session.emit_diagnostic(diagnostic);
     }
 
     pub fn emit_type_constraint_not_type(&mut self, ty: TypeId, loc: SrcLoc) {
-        let diagnostic = Diagnostic::error("type constraint not type").primary(
+        let diagnostic = Diagnostic::error("value used as type").primary(
             loc.source,
             loc.span,
             format!(
@@ -99,22 +93,110 @@ impl Evaluator<'_> {
         ty2: TypeId,
         loc2: SrcLoc,
     ) {
-        assert_eq!(loc1.source, loc2.source);
-        let diagnostic = Diagnostic::error("`if` and `else` have incompatible types").element(
-            Annotations::new(loc1.source)
-                .primary(
-                    loc2.span,
-                    format!(
-                        "expected `{}`, got `{}`",
-                        self.types.format(self.session, ty1),
-                        self.types.format(self.session, ty2),
-                    ),
-                )
-                .secondary(
-                    loc1.span,
-                    format!("`{}` expected because of this", self.types.format(self.session, ty1)),
-                ),
+        let primary_label = format!(
+            "expected `{}`, got `{}`",
+            self.types.format(self.session, ty1),
+            self.types.format(self.session, ty2),
         );
+        let secondary_label =
+            format!("`{}` expected because of this", self.types.format(self.session, ty1));
+        let diagnostic = Diagnostic::error("`if` and `else` have incompatible types")
+            .cross_source_annotations(loc2, primary_label, loc1, secondary_label);
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub fn emit_arg_count_mismatch(
+        &mut self,
+        expected: usize,
+        actual: usize,
+        call_loc: SrcLoc,
+        def_loc: SrcLoc,
+    ) {
+        let s = if expected == 1 { "" } else { "s" };
+        let call_label = format!("expected {expected} argument{s}, got {actual}");
+        let def_label = format!("defined with {expected} parameter{s}");
+        let diagnostic = Diagnostic::error("wrong number of arguments")
+            .cross_source_annotations(call_loc, call_label, def_loc, def_label);
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub fn emit_call_target_not_comptime(&mut self, loc: SrcLoc) {
+        let diagnostic = Diagnostic::error("call target must be known at compile time")
+            .primary(loc.source, loc.span, "not known at compile time")
+            .note("function calls are statically dispatched");
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub fn emit_closure_capture_not_comptime(&mut self, use_loc: SrcLoc, def_loc: SrcLoc) {
+        let diagnostic = Diagnostic::error("closure capture must be known at compile time")
+            .cross_source_annotations(
+                use_loc,
+                "captures a runtime value",
+                def_loc,
+                "not known at compile time",
+            )
+            .note("closures can only capture values known at compile time");
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub fn emit_struct_type_not_comptime(&mut self, loc: SrcLoc) {
+        let diagnostic = Diagnostic::error("struct type must be known at compile time").primary(
+            loc.source,
+            loc.span,
+            "not known at compile time",
+        );
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub fn emit_no_matching_builtin_signature(
+        &mut self,
+        builtin: Builtin,
+        arg_types: &[TypeId],
+        loc: SrcLoc,
+    ) {
+        use std::fmt::Write;
+
+        let mut note = format!("`{builtin}` accepts ");
+        for (i, &(params, _ret)) in builtin.signatures().iter().enumerate() {
+            if i > 0 {
+                note.push_str(", ");
+            }
+            note.push('(');
+            for (j, &ty) in params.iter().enumerate() {
+                if j > 0 {
+                    note.push_str(", ");
+                }
+                let _ = write!(note, "{}", self.types.format(self.session, ty));
+            }
+            note.push(')');
+        }
+
+        let (title, label) = if builtin.signatures()[0].0.len() == arg_types.len() {
+            let mut args_str = String::new();
+            for (i, &ty) in arg_types.iter().enumerate() {
+                if i > 0 {
+                    args_str.push_str(", ");
+                }
+                let _ = write!(args_str, "{}", self.types.format(self.session, ty));
+            }
+            (
+                "no valid match for builtin signature",
+                format!("`{builtin}` cannot be called with ({args_str})"),
+            )
+        } else {
+            let expected = builtin.signatures()[0].0.len();
+            (
+                "wrong number of arguments",
+                format!(
+                    "`{builtin}` called with {} argument{}, but requires {}",
+                    arg_types.len(),
+                    if arg_types.len() == 1 { "" } else { "s" },
+                    expected,
+                ),
+            )
+        };
+
+        let diagnostic = Diagnostic::error(title).primary(loc.source, loc.span, label).note(note);
         self.session.emit_diagnostic(diagnostic);
     }
 }

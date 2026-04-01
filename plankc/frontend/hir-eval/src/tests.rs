@@ -4,8 +4,12 @@ use plank_test_utils::{TestProject, dedent_preserve_blank_lines};
 use plank_values::BigNumInterner;
 
 fn try_lower(source: &str) -> (Mir, BigNumInterner, Session) {
+    try_lower_project(TestProject::single(source))
+}
+
+fn try_lower_project(test_project: TestProject) -> (Mir, BigNumInterner, Session) {
     let mut session = Session::new();
-    let project = TestProject::single(source).build(&mut session);
+    let project = test_project.build(&mut session);
 
     let mut big_nums = BigNumInterner::default();
     let hir = plank_hir::lower(&project, &mut big_nums, &mut session);
@@ -22,13 +26,17 @@ fn assert_lowers_to(source: &str, expected: &str) {
     pretty_assertions::assert_str_eq!(actual.trim(), expected.trim());
 }
 
-fn render_diagnostics(source: &str) -> Vec<String> {
-    let (_, _, session) = try_lower(source);
+fn render_project_diagnostics(test_project: TestProject) -> Vec<String> {
+    let (_, _, session) = try_lower_project(test_project);
     session.diagnostics().iter().map(|d| d.render_plain(&session)).collect()
 }
 
 fn assert_diagnostics(source: &str, expected: &[&str]) {
-    let actual = render_diagnostics(source);
+    assert_project_diagnostics(TestProject::single(source), expected)
+}
+
+fn assert_project_diagnostics(test_project: TestProject, expected: &[&str]) {
+    let actual = render_project_diagnostics(test_project);
     let expected: Vec<String> =
         expected.iter().map(|s| dedent_preserve_blank_lines(s).trim().to_string()).collect();
     let actual: Vec<String> = actual.iter().map(|s| s.trim().to_string()).collect();
@@ -560,7 +568,7 @@ fn test_comptime_struct_def_field_not_type() {
         init { evm_stop(); }
         "#,
         &[r#"
-        error: type constraint not type
+        error: value used as type
          --> main.plk:1:23
           |
         1 | const S = struct { x: 42 };
@@ -578,7 +586,7 @@ fn test_comptime_struct_lit_type_not_type() {
         init { evm_stop(); }
         "#,
         &[r#"
-        error: type constraint not type
+        error: value used as type
          --> main.plk:2:11
           |
         2 | const x = T { };
@@ -597,7 +605,7 @@ fn test_comptime_param_type_not_type() {
         init { evm_stop(); }
         "#,
         &[r#"
-        error: type constraint not type
+        error: value used as type
          --> main.plk:2:17
           |
         2 | const f = fn(x: forty_two) u256 { return x; };
@@ -607,9 +615,8 @@ fn test_comptime_param_type_not_type() {
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: struct type not comptime known")]
-fn test_runtime_struct_lit_type_not_type() {
-    let _ = try_lower(
+fn test_struct_lit_value_as_type_in_init() {
+    assert_diagnostics(
         r#"
         const T = 42;
         init {
@@ -617,26 +624,58 @@ fn test_runtime_struct_lit_type_not_type() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: value used as type
+         --> main.plk:3:13
+          |
+        3 |     let x = T { };
+          |             ^ expected type, got value of type `u256`
+        "#],
     );
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: `type_index` not comptime known")]
+fn test_struct_type_not_comptime_known() {
+    assert_diagnostics(
+        r#"
+        init {
+            let T = calldataload(0);
+            let x = T { };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: struct type must be known at compile time
+         --> main.plk:3:13
+          |
+        3 |     let x = T { };
+          |             ^ not known at compile time
+        "#],
+    );
+}
+
+#[test]
 fn test_runtime_struct_def_field_not_type() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         init {
             let S = struct { x: 42 };
             evm_stop();
         }
         "#,
+        &[r#"
+        error: value used as type
+         --> main.plk:2:25
+          |
+        2 |     let S = struct { x: 42 };
+          |                         ^^ expected type, got value of type `u256`
+        "#],
     );
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: return type not type — error recovery")]
 fn test_runtime_fn_return_type_not_type() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         const forty_two = 42;
         init {
@@ -645,6 +684,13 @@ fn test_runtime_fn_return_type_not_type() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: value used as type
+         --> main.plk:3:18
+          |
+        3 |     let f = fn() forty_two { return 1; };
+          |                  ^^^^^^^^^ expected type, got value of type `u256`
+        "#],
     );
 }
 
@@ -945,9 +991,30 @@ fn test_diagnostic_renders_struct_name() {
 }
 
 #[test]
-#[should_panic(expected = "todo-diagnostic: call target must be comptime-known")]
+fn test_call_target_not_comptime() {
+    assert_diagnostics(
+        r#"
+        init {
+            let f = calldataload(0);
+            f();
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: call target must be known at compile time
+         --> main.plk:3:5
+          |
+        3 |     f();
+          |     ^ not known at compile time
+          |
+          = note: function calls are statically dispatched
+        "#],
+    );
+}
+
+#[test]
 fn test_runtime_call_on_non_function() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         init {
             let x = 5;
@@ -955,5 +1022,142 @@ fn test_runtime_call_on_non_function() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: expected function
+         --> main.plk:3:5
+          |
+        3 |     x();
+          |     ^ `u256` is not callable
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_call_arg_count_mismatch() {
+    assert_diagnostics(
+        r#"
+        const foo = fn(x: u256) u256 { return x; };
+        init {
+            foo(1, 2);
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: wrong number of arguments
+         --> main.plk:3:5
+          |
+        1 | const foo = fn(x: u256) u256 { return x; };
+          |               --------- defined with 1 parameter
+        2 | init {
+        3 |     foo(1, 2);
+          |     ^^^^^^^^^ expected 1 argument, got 2
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_call_arg_count_mismatch() {
+    assert_diagnostics(
+        r#"
+        const f = fn(x: u256) u256 { return x; };
+        const r = f(1, 2);
+        init { evm_stop(); }
+        "#,
+        &[r#"
+        error: wrong number of arguments
+         --> main.plk:2:11
+          |
+        1 | const f = fn(x: u256) u256 { return x; };
+          |             --------- defined with 1 parameter
+        2 | const r = f(1, 2);
+          |           ^^^^^^^ expected 1 argument, got 2
+        "#],
+    );
+}
+
+#[test]
+fn test_cross_file_call_arg_count_mismatch() {
+    assert_project_diagnostics(
+        TestProject::single("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
+            .add_file("other", "const f = fn(x: u256) u256 { return x; };")
+            .add_module("m", ""),
+        &[r#"
+        error: wrong number of arguments
+         --> main.plk:2:8
+          |
+        2 | init { f(1, 2); evm_stop(); }
+          |        ^^^^^^^ expected 1 argument, got 2
+          |
+         ::: other.plk:1:13
+          |
+        1 | const f = fn(x: u256) u256 { return x; };
+          |             --------- defined with 1 parameter
+        "#],
+    );
+}
+
+#[test]
+fn test_no_matching_builtin_signature() {
+    assert_diagnostics(
+        r#"
+        init {
+            add(true, false);
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: no valid match for builtin signature
+         --> main.plk:2:5
+          |
+        2 |     add(true, false);
+          |     ^^^^^^^^^^^^^^^^ `add` cannot be called with (bool, bool)
+          |
+          = note: `add` accepts (u256, u256), (memptr, u256), (u256, memptr)
+        "#],
+    );
+}
+
+#[test]
+fn test_builtin_wrong_arg_count() {
+    assert_diagnostics(
+        r#"
+        init {
+            add(1);
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: wrong number of arguments
+         --> main.plk:2:5
+          |
+        2 |     add(1);
+          |     ^^^^^^ `add` called with 1 argument, but requires 2
+          |
+          = note: `add` accepts (u256, u256), (memptr, u256), (u256, memptr)
+        "#],
+    );
+}
+
+#[test]
+fn test_closure_capture_not_comptime() {
+    assert_diagnostics(
+        r#"
+        init {
+            let x = calldataload(0);
+            let f = fn() u256 { x };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: closure capture must be known at compile time
+         --> main.plk:3:25
+          |
+        2 |     let x = calldataload(0);
+          |             --------------- not known at compile time
+        3 |     let f = fn() u256 { x };
+          |                         ^ captures a runtime value
+          |
+          = note: closures can only capture values known at compile time
+        "#],
     );
 }
