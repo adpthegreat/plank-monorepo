@@ -35,14 +35,18 @@ fn render_diagnostics(source: &str) -> String {
     render_project_diagnostics(TestProject::single(source))
 }
 
-fn render_project_diagnostics(project: TestProject) -> String {
-    let (_hir, _big_nums, session, _project) = try_lower_project(project);
+fn format_session_diagnostics(session: &Session) -> String {
     session
         .diagnostics()
         .iter()
-        .map(|diagnostic| diagnostic.render_plain(&session))
+        .map(|diagnostic| diagnostic.render_plain(session))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_project_diagnostics(project: TestProject) -> String {
+    let (_hir, _big_nums, session, _project) = try_lower_project(project);
+    format_session_diagnostics(&session)
 }
 
 #[test]
@@ -588,4 +592,259 @@ fn test_inline_while_not_yet_supported() {
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_logical_not_literal() {
+    assert_lowers_to(
+        r#"
+        init {
+            let x = !true;
+            let y = !false;
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = true
+        %1 = logical_not %0
+        %2 = false
+        %3 = logical_not %2
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_logical_not_runtime() {
+    assert_lowers_to(
+        r#"
+        init {
+            let c = calldataload(0);
+            let b = iszero(c);
+            let nb = !b;
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = calldataload(%0)
+        %2 = %1
+        %3 = iszero(%2)
+        %4 = %3
+        %5 = logical_not %4
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_and_desugaring() {
+    assert_lowers_to(
+        r#"
+        const slot_good = fn () bool {
+            sstore(0, 0);
+            false
+        };
+
+        init {
+            let a = iszero(calldataload(0));
+            let c = a and slot_good();
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+        ConstId(0) ("slot_good") result=LocalId(0) {
+            %0 = @fn0
+        }
+
+        ==== Functions ====
+        @fn0() -> %0 {
+            preamble:
+                %0 = type#2
+            body:
+                %1 = 0
+                %2 = 0
+                eval sstore(%1, %2)
+                ret false
+        }
+
+        ==== Init ====
+        %0 = 0
+        %1 = calldataload(%0)
+        %2 = iszero(%1)
+        %4 = %2
+        if %4 {
+            %5 = $0
+            %3 [br]= call %5()
+        } else {
+            %3 [br]= false
+        }
+        %6 = %3
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_or_desugaring() {
+    assert_lowers_to(
+        r#"
+        init {
+            let a = iszero(calldataload(0));
+            let c = a or {
+                sstore(1, 1);
+                false
+            };
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = calldataload(%0)
+        %2 = iszero(%1)
+        %4 = %2
+        if %4 {
+            %3 [br]= true
+        } else {
+            %5 = 1
+            %6 = 1
+            eval sstore(%5, %6)
+            %3 [br]= false
+        }
+        %7 = %3
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_binary_op_lowering() {
+    assert_lowers_to(
+        r#"
+        init {
+            let a = calldataload(0x00);
+            let b = calldataload(0x20);
+            let c = a + b;
+            let d = a -/ b;
+            let e = a +/ b;
+            let f = a </ b;
+            let g = a >/ b;
+            let h = a *% b;
+            let i = a << b;
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = calldataload(%0)
+        %2 = 32
+        %3 = calldataload(%2)
+        %4 = %1
+        %5 = %3
+        %6 = (+) %4 %5
+        %7 = %1
+        %8 = %3
+        %9 = (-/) %7 %8
+        %10 = %1
+        %11 = %3
+        %12 = (+/) %10 %11
+        %13 = %1
+        %14 = %3
+        %15 = (</) %13 %14
+        %16 = %1
+        %17 = %3
+        %18 = (>/) %16 %17
+        %19 = %1
+        %20 = %3
+        %21 = (*%) %19 %20
+        %22 = %1
+        %23 = %3
+        %24 = (<<) %22 %23
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_unary_op_lowering() {
+    assert_lowers_to(
+        r#"
+        init {
+            let a = calldataload(0x00);
+            let b = -a;
+            let c = ~a;
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = calldataload(%0)
+        %2 = %1
+        %3 = (-) %2
+        %4 = %1
+        %5 = (~) %4
+        eval evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_lone_slash_not_supported() {
+    let (hir, big_nums, session, _project) = try_lower(
+        r#"
+        init {
+            let a = 10;
+            let b = a / 2;
+            evm_stop();
+        }
+        "#,
+    );
+
+    let rendered = format_session_diagnostics(&session);
+    let expected_diag = dedent_preserve_blank_lines(
+        r#"
+        error: unsupported syntax
+         --> main.plk:3:15
+          |
+        3 |     let b = a / 2;
+          |               ^ lone `/` not supported as an operator
+          |
+          = help: for division rounding towards 0 use `</` (EVM default)
+          = help: for division rounding away from 0 use `>/`
+          = help: for division rounding towards negative infinity use `-/`
+          = help: for division rounding towards positive infinity use `+/`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected_diag.trim());
+
+    let actual_hir = format!("{}", DisplayHir::new(&hir, &big_nums, &session));
+    let expected_hir = dedent_preserve_blank_lines(
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 10
+        %1 = %0
+        %2 = 2
+        %3 = (</) %1 %2
+        eval evm_stop()
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(actual_hir.trim(), expected_hir.trim());
 }

@@ -4,12 +4,14 @@ use hashbrown::HashMap;
 use plank_core::{Idx, IncIterable, IndexVec, Span, list_of_lists::ListOfLists};
 use plank_parser::{
     ast::{self, Statement, TopLevelDef},
-    cst::NumLitId,
+    cst::{self, NumLitId},
     lexer::{Lexed, TokenIdx},
 };
-use plank_session::{Builtin, Session, SourceId, SourceSpan, StrId, TypeId};
+use plank_session::{EvmBuiltin, Session, SourceId, SourceSpan, StrId, TypeId};
 use plank_source::project::{FileImport, ImportKind};
 use plank_values::BigNumInterner;
+
+use crate::operators as hir_ops;
 
 mod diagnostics;
 
@@ -78,6 +80,10 @@ struct BlockLowerer<'a> {
 
     lexed: &'a Lexed,
     source_id: SourceId,
+}
+enum ShortCircuitOp {
+    And,
+    Or,
 }
 
 impl BlockLowerer<'_> {
@@ -172,7 +178,7 @@ impl BlockLowerer<'_> {
     fn alloc_local(&mut self, name: StrId, mutable: bool, span: Span<TokenIdx>) -> LocalId {
         if TypeId::resolve_primitive(name).is_some() {
             self.error_shadowing_primitive_type(name, span);
-        } else if Builtin::from_str_id(name).is_some() {
+        } else if EvmBuiltin::from_str_id(name).is_some() {
             self.error_shadowing_builtin(name, span);
         }
 
@@ -304,7 +310,7 @@ impl BlockLowerer<'_> {
             return ExprKind::Type(ty);
         }
 
-        if Builtin::from_str_id(name).is_some() {
+        if EvmBuiltin::from_str_id(name).is_some() {
             self.error_non_call_reference_to_builtin(name, span);
             return ExprKind::Error;
         }
@@ -351,7 +357,7 @@ impl BlockLowerer<'_> {
             ast::Expr::Call(call_expr) => {
                 let callee = call_expr.callee();
                 if let ast::Expr::Ident { name, span: _ } = callee
-                    && let Some(builtin) = Builtin::from_str_id(name)
+                    && let Some(builtin) = EvmBuiltin::from_str_id(name)
                 {
                     let buf_start = self.locals_buf.len();
                     for arg in call_expr.args() {
@@ -359,7 +365,7 @@ impl BlockLowerer<'_> {
                         self.locals_buf.push(local);
                     }
                     let args = self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..));
-                    ExprKind::BuiltinCall { builtin, args }
+                    ExprKind::EvmBuiltinCall { builtin, args }
                 } else {
                     let callee = self.lower_expr_to_local(callee);
                     let buf_start = self.locals_buf.len();
@@ -427,11 +433,61 @@ impl BlockLowerer<'_> {
             ast::Expr::ComptimeBlock(_) => {
                 todo!("comptime block lowering requires extra HIR instructions")
             }
-            ast::Expr::Binary(binary) => {
-                panic!("binary expression lowering not yet implemented (op: {:?})", binary.op)
+            ast::Expr::Binary(binary) => 'binary: {
+                let op = match binary.op {
+                    // Logical (short-circuit, handled specially)
+                    cst::BinaryOp::And => {
+                        break 'binary self.lower_short_circuit_op(binary, ShortCircuitOp::And);
+                    }
+                    cst::BinaryOp::Or => {
+                        break 'binary self.lower_short_circuit_op(binary, ShortCircuitOp::Or);
+                    }
+                    // Comparison
+                    cst::BinaryOp::DoubleEquals => hir_ops::BinaryOp::NotEquals,
+                    cst::BinaryOp::BangEquals => hir_ops::BinaryOp::Equals,
+                    cst::BinaryOp::LessThan => hir_ops::BinaryOp::LessThan,
+                    cst::BinaryOp::GreaterThan => hir_ops::BinaryOp::GreaterThan,
+                    cst::BinaryOp::LessEquals => hir_ops::BinaryOp::LessEquals,
+                    cst::BinaryOp::GreaterEquals => hir_ops::BinaryOp::GreaterEquals,
+                    // Bitwise
+                    cst::BinaryOp::Pipe => hir_ops::BinaryOp::BitwiseOr,
+                    cst::BinaryOp::Caret => hir_ops::BinaryOp::BitwiseXor,
+                    cst::BinaryOp::Ampersand => hir_ops::BinaryOp::BitwiseAnd,
+                    cst::BinaryOp::ShiftLeft => hir_ops::BinaryOp::ShiftLeft,
+                    cst::BinaryOp::ShiftRight => hir_ops::BinaryOp::ShiftRight,
+                    // Arithmetic (additive)
+                    cst::BinaryOp::Plus => hir_ops::BinaryOp::Add,
+                    cst::BinaryOp::Minus => hir_ops::BinaryOp::Subtract,
+                    cst::BinaryOp::PlusPercent => hir_ops::BinaryOp::AddWrap,
+                    cst::BinaryOp::MinusPercent => hir_ops::BinaryOp::SubtractWrap,
+                    // Arithmetic (multiplicative)
+                    cst::BinaryOp::Star => hir_ops::BinaryOp::Mul,
+                    cst::BinaryOp::Slash => {
+                        self.emit_lone_slash_not_supported(binary.op_span());
+                        hir_ops::BinaryOp::DivRoundToZero
+                    }
+                    cst::BinaryOp::Percent => hir_ops::BinaryOp::Mod,
+                    cst::BinaryOp::StarPercent => hir_ops::BinaryOp::MulWrap,
+                    cst::BinaryOp::PlusSlash => hir_ops::BinaryOp::DivRoundPos,
+                    cst::BinaryOp::MinusSlash => hir_ops::BinaryOp::DivRoundNeg,
+                    cst::BinaryOp::LessSlash => hir_ops::BinaryOp::DivRoundToZero,
+                    cst::BinaryOp::GreaterSlash => hir_ops::BinaryOp::DivRoundAwayFromZero,
+                };
+                let lhs = self.lower_expr_to_local(binary.lhs());
+                let rhs = self.lower_expr_to_local(binary.rhs());
+                ExprKind::BinaryOpCall { op, lhs, rhs }
             }
             ast::Expr::Unary(unary) => {
-                panic!("unary expression lowering not yet implemented (op: {:?})", unary.op)
+                let input = self.lower_expr_to_local(unary.operand());
+                match unary.op {
+                    cst::UnaryOp::Bang => ExprKind::LogicalNot { input },
+                    cst::UnaryOp::Minus => {
+                        ExprKind::UnaryOpCall { op: hir_ops::UnaryOp::Negate, input }
+                    }
+                    cst::UnaryOp::Tilde => {
+                        ExprKind::UnaryOpCall { op: hir_ops::UnaryOp::BitwiseNot, input }
+                    }
+                }
             }
         };
         self.expr(kind, expr.span())
@@ -539,6 +595,44 @@ impl BlockLowerer<'_> {
                 this.emit(empty_else_span, InstructionKind::BranchSet { local: result, expr });
             }),
         }
+    }
+
+    /// Desugars short-circuit boolean operators.
+    /// Lowers OR to: `if <lhs> { true } else { <rhs> }`
+    /// Lowers AND to: `if <lhs> { <rhs> } else { false }`
+    fn lower_short_circuit_op(
+        &mut self,
+        binary: ast::BinaryExpr<'_>,
+        op: ShortCircuitOp,
+    ) -> ExprKind {
+        let op_result_local = self.alloc_temp();
+        let op_lhs_as_condition = self.lower_expr_to_local(binary.lhs());
+
+        // Creates `{ <rhs> }` block.
+        let eval_op_rhs_block = self.create_sub_block(|this| {
+            let rhs_span = binary.rhs().span();
+            let expr = this.lower_expr(binary.rhs());
+            this.emit(rhs_span, InstructionKind::BranchSet { local: op_result_local, expr });
+        });
+
+        // Creates `{ false }` / `{ true }` block.
+        let span = binary.node().span();
+        let short_circuit_block = self.create_sub_block(|this| {
+            let short_circuit_value = match op {
+                ShortCircuitOp::And => false,
+                ShortCircuitOp::Or => true,
+            };
+            let expr = this.expr(ExprKind::Bool(short_circuit_value), span);
+            this.emit(span, InstructionKind::BranchSet { local: op_result_local, expr });
+        });
+
+        let (then_block, else_block) = match op {
+            ShortCircuitOp::Or => (short_circuit_block, eval_op_rhs_block),
+            ShortCircuitOp::And => (eval_op_rhs_block, short_circuit_block),
+        };
+        let r#if = InstructionKind::If { condition: op_lhs_as_condition, then_block, else_block };
+        self.emit(span, r#if);
+        ExprKind::LocalRef(op_result_local)
     }
 
     fn lower_statement(&mut self, stmt: Statement<'_>) {

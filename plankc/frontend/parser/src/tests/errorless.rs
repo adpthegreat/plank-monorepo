@@ -184,7 +184,8 @@ fn test_member_priority() {
                     NumLiteral
                         "3"
                     " "
-                    "*"
+                    Operator
+                        "*"
                     " "
                     MemberExpr
                         Identifier
@@ -401,7 +402,8 @@ fn test_binary_plus() {
                     Identifier
                         "a"
                     " "
-                    "+"
+                    Operator
+                        "+"
                     " "
                     Identifier
                         "b"
@@ -428,7 +430,8 @@ fn test_binary_minus() {
                     Identifier
                         "a"
                     " "
-                    "-"
+                    Operator
+                        "-"
                     " "
                     Identifier
                         "b"
@@ -455,7 +458,8 @@ fn test_binary_double_equals() {
                     Identifier
                         "a"
                     " "
-                    "=="
+                    Operator
+                        "=="
                     " "
                     Identifier
                         "b"
@@ -482,7 +486,8 @@ fn test_binary_not_equals() {
                     Identifier
                         "a"
                     " "
-                    "!="
+                    Operator
+                        "!="
                     " "
                     Identifier
                         "b"
@@ -509,7 +514,8 @@ fn test_binary_greater_than() {
                     Identifier
                         "a"
                     " "
-                    ">"
+                    Operator
+                        ">"
                     " "
                     Identifier
                         "b"
@@ -536,7 +542,8 @@ fn test_binary_and() {
                     Identifier
                         "a"
                     " "
-                    "and"
+                    Operator
+                        "and"
                     " "
                     Identifier
                         "b"
@@ -563,7 +570,8 @@ fn test_binary_ampersand() {
                     Identifier
                         "a"
                     " "
-                    "&"
+                    Operator
+                        "&"
                     " "
                     Identifier
                         "b"
@@ -590,13 +598,15 @@ fn test_binary_precedence_mul_add() {
                     NumLiteral
                         "1"
                     " "
-                    "+"
+                    Operator
+                        "+"
                     " "
                     BinaryExpr(Star)
                         NumLiteral
                             "2"
                         " "
-                        "*"
+                        Operator
+                            "*"
                         " "
                         NumLiteral
                             "3"
@@ -624,18 +634,21 @@ fn test_binary_precedence_cmp_and() {
                         Identifier
                             "a"
                         " "
-                        "<"
+                        Operator
+                            "<"
                         " "
                         Identifier
                             "b"
                         " "
-                    "and"
+                    Operator
+                        "and"
                     " "
                     BinaryExpr(GreaterThan)
                         Identifier
                             "c"
                         " "
-                        ">"
+                        Operator
+                            ">"
                         " "
                         Identifier
                             "d"
@@ -1920,7 +1933,8 @@ fn test_assign_stmt_complex_rhs() {
                             Identifier
                                 "a"
                             " "
-                            "+"
+                            Operator
+                                "+"
                             " "
                             Identifier
                                 "b"

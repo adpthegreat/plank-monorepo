@@ -61,7 +61,7 @@ impl<'a> DisplayHir<'a> {
                 self.fmt_local(f, callee)?;
                 self.fmt_args(f, args)
             }
-            Expr::BuiltinCall { builtin, args } => {
+            Expr::EvmBuiltinCall { builtin, args } => {
                 write!(f, "{builtin}")?;
                 self.fmt_args(f, args)
             }
@@ -88,6 +88,20 @@ impl<'a> DisplayHir<'a> {
                 write!(f, "}}")
             }
             Expr::StructDef(id) => self.fmt_struct_ref(f, id),
+            Expr::LogicalNot { input } => {
+                write!(f, "logical_not ")?;
+                self.fmt_local(f, input)
+            }
+            Expr::UnaryOpCall { op, input } => {
+                write!(f, "({}) ", op.symbol())?;
+                self.fmt_local(f, input)
+            }
+            Expr::BinaryOpCall { op, lhs, rhs } => {
+                write!(f, "({}) ", op.symbol())?;
+                self.fmt_local(f, lhs)?;
+                write!(f, " ")?;
+                self.fmt_local(f, rhs)
+            }
             Expr::Error => write!(f, "<error>"),
         }
     }

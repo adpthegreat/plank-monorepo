@@ -1,8 +1,5 @@
 use crate::Evaluator;
-use plank_session::{
-    builtins::{Builtin, builtin_names},
-    *,
-};
+use plank_session::{builtins::builtin_names, *};
 
 impl Evaluator<'_> {
     pub fn emit_type_mismatch_error(
@@ -148,9 +145,15 @@ impl Evaluator<'_> {
         self.session.emit_diagnostic(diagnostic);
     }
 
+    pub(crate) fn emit_not_yet_implemented(&mut self, loc: SrcLoc) {
+        let diagnostic = Diagnostic::error("not yet implemented")
+            .element(Annotations::new(loc.source).no_label(loc.span, AnnotationKind::Primary));
+        self.session.emit_diagnostic(diagnostic);
+    }
+
     pub fn emit_no_matching_builtin_signature(
         &mut self,
-        builtin: Builtin,
+        builtin: EvmBuiltin,
         arg_types: &[TypeId],
         loc: SrcLoc,
     ) {
