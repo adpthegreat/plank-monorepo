@@ -21,11 +21,12 @@ pub enum Expr<'cst> {
     BoolLiteral { value: bool, span: Span<TokenIdx> },
     NumLiteral { negative: bool, id: NumLitId, span: Span<TokenIdx> },
     Ident { name: StrId, span: Span<TokenIdx> },
+    Error { span: Span<TokenIdx> },
 }
 
 impl<'cst> Expr<'cst> {
     pub fn new_unwrap(view: NodeView<'cst>) -> Self {
-        Expr::new(view).expect("expected expression node")
+        Expr::new(view).unwrap_or(Expr::Error { span: view.span() })
     }
 
     /// Creates an Expr from a NodeView. Returns `None` for non-expression nodes.
@@ -44,7 +45,10 @@ impl<'cst> Expr<'cst> {
                 NodeKind::BinaryExpr(op) => Expr::Binary(BinaryExpr { op, view }),
                 NodeKind::UnaryExpr(op) => Expr::Unary(UnaryExpr { op, view }),
                 NodeKind::CallExpr => Expr::Call(CallExpr { view }),
-                NodeKind::MemberExpr => Expr::Member(MemberExpr::new(view).unwrap()),
+                NodeKind::MemberExpr => match MemberExpr::new(view) {
+                    Some(member) => Expr::Member(member),
+                    None => Expr::Error { span },
+                },
                 NodeKind::StructDef => Expr::StructDef(StructDef { view }),
                 NodeKind::StructLit => Expr::StructLit(StructLit { view }),
                 NodeKind::If => Expr::If(IfExpr { view }),
@@ -54,6 +58,7 @@ impl<'cst> Expr<'cst> {
                 NodeKind::BoolLiteral(value) => Expr::BoolLiteral { value, span },
                 NodeKind::NumLiteral { negative, id } => Expr::NumLiteral { negative, id, span },
                 NodeKind::Identifier { ident } => Expr::Ident { name: ident, span },
+                NodeKind::Error => Expr::Error { span },
                 _ => return None,
             };
             return Some(expr);
@@ -76,7 +81,8 @@ impl<'cst> Expr<'cst> {
             | Expr::ComptimeBlock(BlockExpr { view, .. }) => view.span(),
             Expr::BoolLiteral { span, .. }
             | Expr::NumLiteral { span, .. }
-            | Expr::Ident { span, .. } => *span,
+            | Expr::Ident { span, .. }
+            | Expr::Error { span, .. } => *span,
         }
     }
 }
@@ -89,8 +95,7 @@ pub struct BinaryExpr<'cst> {
 
 impl<'cst> BinaryExpr<'cst> {
     pub fn lhs(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("BinaryExpr must have lhs child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn op_span(&self) -> Span<TokenIdx> {
@@ -98,8 +103,7 @@ impl<'cst> BinaryExpr<'cst> {
     }
 
     pub fn rhs(&self) -> Expr<'cst> {
-        let child = self.view.child(2).expect("BinaryExpr must have rhs child");
-        Expr::new_unwrap(child)
+        self.view.child(2).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -116,8 +120,7 @@ pub struct UnaryExpr<'cst> {
 
 impl<'cst> UnaryExpr<'cst> {
     pub fn operand(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("UnaryExpr must have operand child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -133,8 +136,7 @@ pub struct CallExpr<'cst> {
 
 impl<'cst> CallExpr<'cst> {
     pub fn callee(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("CallExpr must have callee child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn args(&self) -> impl Iterator<Item = Expr<'cst>> {
@@ -158,13 +160,12 @@ impl<'cst> MemberExpr<'cst> {
         if view.kind() != NodeKind::MemberExpr {
             return None;
         }
-        let member = view.child(1).and_then(NodeView::ident).expect("TODO: Malformed member expr");
+        let member = view.child(1).and_then(NodeView::ident)?;
         Some(Self { member, view })
     }
 
     pub fn object(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("MemberExpr must have object child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -207,10 +208,7 @@ impl<'cst> FieldDef<'cst> {
     fn new(view: NodeView<'cst>) -> Option<Self> {
         match view.kind() {
             NodeKind::FieldDef => {
-                let name = view
-                    .child(0)
-                    .and_then(|v| v.kind().as_ident())
-                    .expect("TODO: handle malformed FieldDef");
+                let name = view.child(0).and_then(|v| v.kind().as_ident())?;
                 Some(Self { name, view })
             }
             _ => None,
@@ -218,8 +216,7 @@ impl<'cst> FieldDef<'cst> {
     }
 
     pub fn type_expr(&self) -> Expr<'cst> {
-        let child = self.view.child(1).expect("FieldDef must have type_expr child");
-        Expr::new_unwrap(child)
+        self.view.child(1).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -235,8 +232,7 @@ pub struct StructLit<'cst> {
 
 impl<'cst> StructLit<'cst> {
     pub fn type_expr(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("StructLit must have type_expr child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn fields(&self) -> impl Iterator<Item = FieldAssign<'cst>> {
@@ -259,10 +255,7 @@ impl<'cst> FieldAssign<'cst> {
     fn new(view: NodeView<'cst>) -> Option<Self> {
         match view.kind() {
             NodeKind::FieldAssign => {
-                let name = view
-                    .child(0)
-                    .and_then(|v| v.kind().as_ident())
-                    .expect("TODO: handle malformed FieldAssign");
+                let name = view.child(0).and_then(|v| v.kind().as_ident())?;
                 Some(Self { name, view })
             }
             _ => None,
@@ -270,8 +263,7 @@ impl<'cst> FieldAssign<'cst> {
     }
 
     pub fn value(&self) -> Expr<'cst> {
-        let child = self.view.child(1).expect("FieldAssign must have value child");
-        Expr::new_unwrap(child)
+        self.view.child(1).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -287,8 +279,7 @@ pub struct IfExpr<'cst> {
 
 impl<'cst> IfExpr<'cst> {
     pub fn condition(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("If must have condition child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn body(&self) -> BlockExpr<'cst> {
@@ -327,8 +318,7 @@ impl<'cst> ElseIfBranch<'cst> {
     }
 
     pub fn condition(&self) -> Expr<'cst> {
-        let node = self.view.child(0).expect("ElseIfBranch must have condition child");
-        Expr::new_unwrap(node)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn body(&self) -> BlockExpr<'cst> {
@@ -354,8 +344,7 @@ impl<'cst> FnDef<'cst> {
     }
 
     pub fn return_type(&self) -> Expr<'cst> {
-        let node = self.view.child(1).expect("FnDef must have return_type child");
-        Expr::new_unwrap(node)
+        self.view.child(1).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn body(&self) -> BlockExpr<'cst> {
@@ -383,16 +372,12 @@ impl<'cst> Param<'cst> {
             NodeKind::ComptimeParameter => true,
             _ => return None,
         };
-        let name = view
-            .child(0)
-            .and_then(|v| v.kind().as_ident())
-            .expect("TODO: handle malformed Parameter");
+        let name = view.child(0).and_then(|v| v.kind().as_ident())?;
         Some(Self { name, is_comptime: comptime, view })
     }
 
     pub fn type_expr(&self) -> Expr<'cst> {
-        let node = self.view.child(1).expect("Parameter must have type_expr child");
-        Expr::new_unwrap(node)
+        self.view.child(1).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn name_span(&self) -> Span<TokenIdx> {
@@ -424,11 +409,11 @@ impl<'cst> LetStmt<'cst> {
             return None;
         };
         let mut children = view.children();
-        let name_view = children.next().expect("TODO: malformed");
+        let name_view = children.next()?;
         let name_span = name_view.span();
-        let name = name_view.ident().expect("TODO: malformed");
-        let type_view = typed.then(|| children.next().expect("TODO: malformed"));
-        let value_view = children.next().expect("TODO: malformed");
+        let name = name_view.ident()?;
+        let type_view = if typed { Some(children.next()?) } else { None };
+        let value_view = children.next()?;
         Some(Self { name, name_span, mutable, type_view, value_view })
     }
 
@@ -456,8 +441,7 @@ impl<'cst> ReturnStmt<'cst> {
     }
 
     pub fn value(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("ReturnStmt must have value child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -480,13 +464,11 @@ impl<'cst> AssignStmt<'cst> {
     }
 
     pub fn target(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("AssignStmt must have target child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn value(&self) -> Expr<'cst> {
-        let child = self.view.child(1).expect("AssignStmt must have value child");
-        Expr::new_unwrap(child)
+        self.view.child(1).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn node(&self) -> NodeView<'cst> {
@@ -512,8 +494,7 @@ impl<'cst> WhileStmt<'cst> {
     }
 
     pub fn condition(&self) -> Expr<'cst> {
-        let child = self.view.child(0).expect("WhileStmt must have condition child");
-        Expr::new_unwrap(child)
+        self.view.child(0).map(Expr::new_unwrap).unwrap_or(Expr::Error { span: self.view.span() })
     }
 
     pub fn body(&self) -> BlockExpr<'cst> {
@@ -533,6 +514,7 @@ pub enum Statement<'cst> {
     Assign(AssignStmt<'cst>),
     While(WhileStmt<'cst>),
     Expr(Expr<'cst>),
+    Error { span: Span<TokenIdx> },
 }
 
 impl<'cst> Statement<'cst> {
@@ -574,9 +556,11 @@ impl<'cst> BlockExpr<'cst> {
 
     /// Returns an iterator over the statements in this block.
     pub fn statements(&self) -> impl Iterator<Item = Statement<'cst>> {
-        let list = self.view.child(0).expect("todo: malformed block missing stmt list child");
-        list.children()
-            .map(|view| Statement::new(view).expect("todo: non-statement child of stmt list"))
+        self.view
+            .child(0)
+            .into_iter()
+            .flat_map(|list| list.children())
+            .map(|view| Statement::new(view).unwrap_or(Statement::Error { span: view.span() }))
     }
 
     /// Returns the trailing/end expression if present.
