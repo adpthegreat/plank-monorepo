@@ -1,12 +1,12 @@
 use hashbrown::{HashMap, hash_map::Entry};
 use plank_core::span::IncIterable;
 use sir_data::{
-    BasicBlock, BasicBlockId, BlockView, Branch, Cases, Control, ControlView, DataId,
-    DenseIndexSet, EthIRProgram, Function, FunctionId, Idx, LargeConstId, LocalId, LocalIdx,
-    Operation, OperationIdx, Span, StaticAllocId, Switch, operation::OpVisitorMut,
+    BasicBlock, BasicBlockId, BlockView, Branch, Cases, Control, ControlView, DataId, EthIRProgram,
+    Function, FunctionId, Idx, LargeConstId, LocalId, LocalIdx, Operation, OperationIdx, Span,
+    StaticAllocId, Switch, operation::OpVisitorMut,
 };
 
-use crate::{AnalysesStore, Pass};
+use crate::{AnalysesStore, Pass, analyses::Reachability};
 
 #[derive(Default)]
 pub struct Defragmenter {
@@ -18,12 +18,12 @@ impl Pass for Defragmenter {
     fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
         self.state.clear();
         self.scratch.clear();
-        let live_blocks = store.sccp_reachable.get_if_valid();
+        let reachability = store.reachability(program);
         Rewriter {
             state: &mut self.state,
             src: program,
             dst: &mut self.scratch,
-            live_blocks: live_blocks.as_deref(),
+            reachability: &reachability,
         }
         .rewrite();
         std::mem::swap(program, &mut self.scratch);
@@ -59,7 +59,7 @@ struct Rewriter<'a> {
     state: &'a mut DefragmenterState,
     src: &'a EthIRProgram,
     dst: &'a mut EthIRProgram,
-    live_blocks: Option<&'a DenseIndexSet<BasicBlockId>>,
+    reachability: &'a Reachability,
 }
 
 impl<'a> Rewriter<'a> {
@@ -114,7 +114,7 @@ impl<'a> Rewriter<'a> {
     }
 
     fn emit_block(&mut self, old_id: BasicBlockId) {
-        if self.live_blocks.is_some_and(|blocks| !blocks.contains(old_id)) {
+        if !self.reachability.contains(old_id) {
             return;
         }
 
@@ -200,10 +200,7 @@ impl<'a> Rewriter<'a> {
     }
 
     fn push_block(&mut self, bb: BasicBlockId) {
-        debug_assert!(
-            self.live_blocks.is_none_or(|live| live.contains(bb)),
-            "successor {bb:?} should be in live_blocks"
-        );
+        debug_assert!(self.reachability.contains(bb), "successor {bb:?} should be reachable");
         if !self.state.block_map.contains_key(&bb) {
             self.state.block_worklist.push(bb);
         }
@@ -650,5 +647,78 @@ Basic Blocks:
 data .0 0x1234
         "#;
         assert_trim_strings_eq_with_diff(&actual, expected, "defragment dead function data");
+    }
+
+    #[test]
+    fn test_structural_vs_sccp_reachability() {
+        let input = r#"
+            fn init:
+                entry {
+                    cond = const 1
+                    => cond ? @live : @dead
+                }
+                live { stop }
+                dead { stop }
+                orphan { stop }
+        "#;
+
+        // Structural reachability removes orphan but keeps both branches
+        let mut ir_structural = parse_or_panic(input, EmitConfig::init_only());
+        let store = AnalysesStore::default();
+        run_pass(&mut Defragmenter::default(), &mut ir_structural, &store);
+
+        let structural_result = sir_data::display_program(&ir_structural);
+        let expected_structural = r#"
+Init: @0
+Functions:
+    fn @0 -> entry @0  (outputs: 0)
+
+Basic Blocks:
+    @0 {
+        $0 = const 0x1
+        => $0 ? @2 : @1
+    }
+
+    @1 {
+        stop
+    }
+
+    @2 {
+        stop
+    }
+        "#;
+        assert_trim_strings_eq_with_diff(
+            &structural_result,
+            expected_structural,
+            "structural reachability removes orphan but keeps both branches",
+        );
+
+        // SCCP-refined reachability additionally eliminates the dead branch
+        let mut ir_sccp = parse_or_panic(input, EmitConfig::init_only());
+        let store = AnalysesStore::default();
+        run_pass(&mut SCCP::default(), &mut ir_sccp, &store);
+        run_pass(&mut Defragmenter::default(), &mut ir_sccp, &store);
+
+        let sccp_result = sir_data::display_program(&ir_sccp);
+        let expected_sccp = r#"
+Init: @0
+Functions:
+    fn @0 -> entry @0  (outputs: 0)
+
+Basic Blocks:
+    @0 {
+        $0 = const 0x1
+        => @1
+    }
+
+    @1 {
+        stop
+    }
+        "#;
+        assert_trim_strings_eq_with_diff(
+            &sccp_result,
+            expected_sccp,
+            "sccp reachability also eliminates dead branch",
+        );
     }
 }
