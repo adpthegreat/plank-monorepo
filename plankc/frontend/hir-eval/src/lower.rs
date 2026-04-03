@@ -19,7 +19,7 @@ const FIELDS_BUF_CAPACITY: usize = 128;
 struct FunctionLowerScope {
     expected_return_type: TypeId,
     expected_return_type_loc: Option<SrcLoc>,
-    locals: Locals,
+    runtime_locals: RuntimeLocals,
     interpreter: ComptimeInterpreter,
 
     instr_buf_stack: Vec<mir::Instruction>,
@@ -44,6 +44,18 @@ impl ExprResult {
 struct BlockControlFlowDiverges;
 
 impl FunctionLowerScope {
+    fn comptime_value(&self, hir: hir::LocalId) -> Option<ValueId> {
+        self.interpreter.bindings.get(hir).map(|&(vid, _)| vid)
+    }
+
+    fn get_type(&self, hir: hir::LocalId, values: &ValueInterner) -> TypeId {
+        if let Some(mir) = self.runtime_locals.get_mir(hir) {
+            return self.runtime_locals.mir_type(mir);
+        }
+        let (vid, _) = self.interpreter.bindings[hir];
+        values.type_of_value(vid)
+    }
+
     fn materialize(
         &mut self,
         values: &ValueInterner,
@@ -72,7 +84,7 @@ impl FunctionLowerScope {
             let target = match expr {
                 mir::Expr::LocalRef(local) => local,
                 expr => {
-                    let target = self.locals.alloc_anonymous_mir(ty);
+                    let target = self.runtime_locals.alloc_anonymous_mir(ty);
                     self.instr_buf_stack.push(mir::Instruction::Set { target, expr });
                     target
                 }
@@ -89,8 +101,8 @@ impl FunctionLowerScope {
         ty: hir::LocalId,
         fields: hir::FieldsId,
     ) -> ExprResult {
-        let ty_loc = self.locals.def_loc(ty);
-        let Some(ty) = self.locals.comptime(ty) else {
+        let ty_loc = self.runtime_locals.def_loc(ty);
+        let Some(ty) = self.comptime_value(ty) else {
             eval.emit_struct_type_not_comptime(ty_loc);
             return ExprResult::ERROR;
         };
@@ -116,12 +128,12 @@ impl FunctionLowerScope {
                 todo!("diagnostic: duplicate struct field assignment");
             }
             let expected_field_ty = r#struct.field_types[field_pos];
-            let field_value_ty = self.locals.get_type(field.value, &eval.values);
+            let field_value_ty = self.get_type(field.value, &eval.values);
             if !field_value_ty.is_assignable_to(expected_field_ty) {
                 eval.emit_type_mismatch_simple(
                     expected_field_ty,
                     field_value_ty,
-                    self.locals.def_loc(field.value),
+                    self.runtime_locals.def_loc(field.value),
                 );
             }
         }
@@ -137,7 +149,7 @@ impl FunctionLowerScope {
                 else {
                     todo!("diagnostic: literal missing struct field");
                 };
-                let Some(value) = self.locals.comptime(field.value) else {
+                let Some(value) = self.comptime_value(field.value) else {
                     todo!("diagnostic: non-comptime field in struct with comptime-only fields");
                 };
                 self.values_buf.push(value);
@@ -157,14 +169,14 @@ impl FunctionLowerScope {
                 todo!("diagnostic: literal missing struct field");
             };
             if comptime_known {
-                if let Some(value) = self.locals.comptime(field.value) {
+                if let Some(value) = self.comptime_value(field.value) {
                     self.values_buf.push(value);
                 } else {
                     comptime_known = false;
                 }
             }
             // Only comptime only values may have value but no hir local.
-            self.mir_buf_stack.push(self.locals.hir_to_mir(field.value));
+            self.mir_buf_stack.push(self.runtime_locals.hir_to_mir(field.value));
         }
         let fields = eval.mir_args.push_iter(self.mir_buf_stack.drain(mir_start..));
         let comptime = comptime_known.then(|| {
@@ -200,14 +212,14 @@ impl FunctionLowerScope {
                     }
 
                     for (&input, &arg) in input_types.iter().zip(args) {
-                        if !input.is_assignable_to(self.locals.get_type(arg, &eval.values)) {
+                        if !input.is_assignable_to(self.get_type(arg, &eval.values)) {
                             continue 'sig;
                         }
                     }
 
                     let args = eval
                         .mir_args
-                        .push_iter(args.iter().map(|&arg| self.locals.hir_to_mir(arg)));
+                        .push_iter(args.iter().map(|&arg| self.runtime_locals.hir_to_mir(arg)));
                     return ExprResult::Runtime {
                         expr: mir::Expr::BuiltinCall { builtin, args },
                         ty: result_type,
@@ -215,7 +227,7 @@ impl FunctionLowerScope {
                     };
                 }
                 for arg in args {
-                    self.field_types_buf.push(self.locals.get_type(*arg, &eval.values));
+                    self.field_types_buf.push(self.get_type(*arg, &eval.values));
                 }
                 eval.emit_no_matching_builtin_signature(
                     builtin,
@@ -226,20 +238,28 @@ impl FunctionLowerScope {
                 ExprResult::ERROR
             }
             hir::ExprKind::LocalRef(hir) => {
-                let value = self.locals.comptime(hir);
-                let mir = self.locals.get_mir(hir);
+                let value = self.comptime_value(hir);
+                let mir = self.runtime_locals.get_mir(hir);
                 match (mir, value) {
                     (Some(mir), comptime) => ExprResult::Runtime {
                         expr: mir::Expr::LocalRef(mir),
-                        ty: self.locals.mir_type(mir),
+                        ty: self.runtime_locals.mir_type(mir),
                         comptime,
                     },
-                    (None, Some(value)) => ExprResult::ComptimeOnly(value),
+                    (None, Some(value)) => {
+                        match self.materialize(&eval.values, &eval.types, &mut eval.mir_args, value)
+                        {
+                            Some((expr, ty)) => {
+                                ExprResult::Runtime { expr, ty, comptime: Some(value) }
+                            }
+                            None => ExprResult::ComptimeOnly(value),
+                        }
+                    }
                     (None, None) => unreachable!("undefined hir {hir:?}"),
                 }
             }
             hir::ExprKind::ConstRef(id) => {
-                let value = eval.ensure_const_evaluated(&mut self.interpreter, id);
+                let value = eval.get_const(id);
                 match self.materialize(&eval.values, &eval.types, &mut eval.mir_args, value) {
                     None => ExprResult::ComptimeOnly(value),
                     Some((expr, ty)) => ExprResult::Runtime { expr, ty, comptime: Some(value) },
@@ -250,15 +270,15 @@ impl FunctionLowerScope {
                 let captures = &eval.hir.fn_captures[fn_def];
                 assert!(self.captures_buf.is_empty());
                 for capture in captures {
-                    let vid = self.locals.comptime(capture.outer_local).unwrap_or_else(|| {
+                    let vid = self.comptime_value(capture.outer_local).unwrap_or_else(|| {
                         let use_loc = SrcLoc::new(expr.source_id, capture.use_span);
                         eval.emit_closure_capture_not_comptime(
                             use_loc,
-                            self.locals.def_loc(capture.outer_local),
+                            self.runtime_locals.def_loc(capture.outer_local),
                         );
                         ValueId::ERROR
                     });
-                    let loc = self.locals.def_loc(capture.outer_local);
+                    let loc = self.runtime_locals.def_loc(capture.outer_local);
                     self.captures_buf.push((vid, loc));
                 }
                 let value_id =
@@ -267,8 +287,8 @@ impl FunctionLowerScope {
                 ExprResult::ComptimeOnly(value_id)
             }
             hir::ExprKind::Call { callee, args } => {
-                let callee_loc = self.locals.def_loc(callee);
-                let Some(closure) = self.locals.comptime(callee) else {
+                let callee_loc = self.runtime_locals.def_loc(callee);
+                let Some(closure) = self.comptime_value(callee) else {
                     eval.emit_call_target_not_comptime(callee_loc);
                     return ExprResult::ERROR;
                 };
@@ -302,20 +322,19 @@ impl FunctionLowerScope {
 
                 for (arg_i, &arg_local) in arg_locals.iter().enumerate() {
                     let expected_ty = eval.mir_fn_locals[callee][arg_i];
-                    let actual_ty = self.locals.get_type(arg_local, &eval.values);
+                    let actual_ty = self.get_type(arg_local, &eval.values);
                     if !actual_ty.is_assignable_to(expected_ty) {
                         eval.emit_type_mismatch_simple(
                             expected_ty,
                             actual_ty,
-                            self.locals.def_loc(arg_local),
+                            self.runtime_locals.def_loc(arg_local),
                         );
                     }
                 }
 
-                let args =
-                    eval.mir_args.push_iter(arg_locals.iter().map(|&hir| {
-                        self.locals.get_mir(hir).expect("todo: non-runtime arg handling")
-                    }));
+                let args = eval.mir_args.push_iter(arg_locals.iter().map(|&hir| {
+                    self.runtime_locals.get_mir(hir).expect("todo: non-runtime arg handling")
+                }));
 
                 ExprResult::Runtime {
                     expr: mir::Expr::Call { callee, args },
@@ -325,20 +344,20 @@ impl FunctionLowerScope {
             }
             hir::ExprKind::StructDef(struct_def_id) => {
                 let struct_def = eval.hir.struct_defs[struct_def_id];
-                let Some(type_index) = self.locals.comptime(struct_def.type_index) else {
+                let Some(type_index) = self.comptime_value(struct_def.type_index) else {
                     todo!("diagnostic: `type_index` not comptime known");
                 };
                 let fields = &eval.hir.fields[struct_def.fields];
                 assert!(self.field_types_buf.is_empty());
                 assert!(self.field_names_buf.is_empty());
                 for field in fields {
-                    let Some(value) = self.locals.comptime(field.value) else {
+                    let Some(value) = self.comptime_value(field.value) else {
                         todo!("diagnostic: field type not comptime known");
                     };
                     let Value::Type(r#type) = eval.values.lookup(value) else {
                         eval.emit_type_constraint_not_type(
                             eval.values.type_of_value(value),
-                            self.locals.def_loc(field.value),
+                            self.runtime_locals.def_loc(field.value),
                         );
                         self.field_types_buf.push(TypeId::ERROR);
                         self.field_names_buf.push(field.name);
@@ -362,9 +381,9 @@ impl FunctionLowerScope {
                 self.translate_struct_literal(eval, ty, fields)
             }
             hir::ExprKind::Member { object, member } => {
-                let ty = self.locals.get_type(object, &eval.values);
+                let ty = self.get_type(object, &eval.values);
                 let Type::Struct(r#struct) = eval.types.lookup(ty) else {
-                    eval.emit_member_on_non_struct(ty, self.locals.def_loc(object));
+                    eval.emit_member_on_non_struct(ty, self.runtime_locals.def_loc(object));
                     return ExprResult::ComptimeOnly(ValueId::ERROR);
                 };
                 let Some(field_index) =
@@ -372,13 +391,13 @@ impl FunctionLowerScope {
                 else {
                     todo!("diagnostic: access undefined attribute");
                 };
-                let value = self.locals.comptime(object).map(|object| {
+                let value = self.comptime_value(object).map(|object| {
                     let Value::StructVal { ty: _, fields } = eval.values.lookup(object) else {
                         unreachable!("invalid hir: type soundness");
                     };
                     fields[field_index]
                 });
-                let mir = self.locals.get_mir(object);
+                let mir = self.runtime_locals.get_mir(object);
                 match (mir, value) {
                     (Some(object), comptime) => ExprResult::Runtime {
                         expr: mir::Expr::FieldAccess { object, field_index: field_index as u32 },
@@ -390,16 +409,20 @@ impl FunctionLowerScope {
                 }
             }
             hir::ExprKind::LogicalNot { input } => {
-                let ty = self.locals.get_type(input, &eval.values);
+                let ty = self.get_type(input, &eval.values);
                 if ty != TypeId::ERROR && !ty.is_assignable_to(TypeId::BOOL) {
-                    eval.emit_type_mismatch_simple(TypeId::BOOL, ty, self.locals.def_loc(input));
+                    eval.emit_type_mismatch_simple(
+                        TypeId::BOOL,
+                        ty,
+                        self.runtime_locals.def_loc(input),
+                    );
                 }
-                let comptime = self.locals.comptime(input).map(|vid| match vid {
+                let comptime = self.comptime_value(input).map(|vid| match vid {
                     ValueId::TRUE => ValueId::FALSE,
                     ValueId::FALSE => ValueId::TRUE,
                     _ => ValueId::ERROR,
                 });
-                let mir_input = self.locals.hir_to_mir(input);
+                let mir_input = self.runtime_locals.hir_to_mir(input);
                 let args = eval.mir_args.push_iter(std::iter::once(mir_input));
                 ExprResult::Runtime {
                     expr: mir::Expr::BuiltinCall { builtin: EvmBuiltin::IsZero, args },
@@ -432,14 +455,13 @@ impl FunctionLowerScope {
         let hir_captures = &eval.hir.fn_captures[fn_def];
 
         // TODO: Optimize to use same allocation across scopes.
-        let saved_locals = std::mem::take(&mut self.locals);
-
-        self.interpreter.reset();
+        let saved_locals = std::mem::take(&mut self.runtime_locals);
+        let saved_bindings = std::mem::take(&mut self.interpreter.bindings);
         // Insert captures.
         for (capture_info, &(value, loc)) in hir_captures.iter().zip(captures) {
             let prev = self.interpreter.bindings.insert(capture_info.inner_local, (value, loc));
             assert!(prev.is_none(), "invalid hir");
-            self.locals.set_comptime_only(capture_info.inner_local, value, loc);
+            self.runtime_locals.register_def_loc(capture_info.inner_local, loc);
         }
         // Interpret type preamble to determine types.
         self.interpreter
@@ -451,7 +473,8 @@ impl FunctionLowerScope {
                 eval.values.type_of_value(return_type),
                 return_type_loc,
             );
-            self.locals = saved_locals;
+            self.runtime_locals = saved_locals;
+            self.interpreter.bindings = saved_bindings;
             return eval.push_error_fn();
         };
         let saved_return_type = std::mem::replace(&mut self.expected_return_type, return_type);
@@ -467,17 +490,18 @@ impl FunctionLowerScope {
                     TypeId::ERROR
                 }
             };
-            self.locals.associate_hir_to_new_mir(param.value, ty, param_src_loc);
+            self.runtime_locals.associate_hir_to_new_mir(param.value, ty, param_src_loc);
         }
 
         let (body, _) = self.translate_block(eval, func.body);
 
-        let fn_id1 = eval.mir_fn_locals.push_iter(self.locals.mir_types());
+        let fn_id1 = eval.mir_fn_locals.push_iter(self.runtime_locals.mir_types());
         let fn_id2 =
             eval.mir_fns.push(mir::FnDef { body, param_count: params.len() as u32, return_type });
         assert_eq!(fn_id1, fn_id2);
 
-        self.locals = saved_locals;
+        self.runtime_locals = saved_locals;
+        self.interpreter.bindings = saved_bindings;
         self.expected_return_type = saved_return_type;
         self.expected_return_type_loc = saved_return_type_loc;
 
@@ -485,13 +509,13 @@ impl FunctionLowerScope {
     }
 
     fn expect_type(&mut self, eval: &mut Evaluator<'_>, local: hir::LocalId) -> TypeId {
-        let Some(type_value) = self.locals.comptime(local) else {
+        let Some(type_value) = self.comptime_value(local) else {
             todo!("diagnostic: AssertType of_type must be comptime")
         };
         let Value::Type(expected) = eval.values.lookup(type_value) else {
             eval.emit_type_constraint_not_type(
-                self.locals.get_type(local, &eval.values),
-                self.locals.def_loc(local),
+                self.get_type(local, &eval.values),
+                self.runtime_locals.def_loc(local),
             );
             return TypeId::ERROR;
         };
@@ -510,7 +534,7 @@ impl FunctionLowerScope {
                     let expr_loc = expr.src_loc();
                     let ty = match self.translate_expr(eval, expr) {
                         ExprResult::Runtime { expr, ty, comptime } => {
-                            match self.locals.set(local, ty, expr_loc, comptime) {
+                            match self.runtime_locals.set(local, ty, expr_loc) {
                                 Ok(target) => {
                                     self.instr_buf_stack
                                         .push(mir::Instruction::Set { target, expr });
@@ -518,16 +542,20 @@ impl FunctionLowerScope {
                                 Err(TypeMismatchError { expected_ty, received_ty }) => {
                                     eval.emit_type_mismatch_error(
                                         expected_ty,
-                                        self.locals.def_loc(local),
+                                        self.runtime_locals.def_loc(local),
                                         received_ty,
                                         expr_loc,
                                     );
                                 }
                             }
+                            if let Some(value) = comptime {
+                                self.interpreter.bindings.insert(local, (value, expr_loc));
+                            }
                             ty
                         }
                         ExprResult::ComptimeOnly(value) => {
-                            self.locals.set_comptime_only(local, value, def_loc);
+                            self.interpreter.bindings.insert(local, (value, def_loc));
+                            self.runtime_locals.register_def_loc(local, def_loc);
                             eval.values.type_of_value(value)
                         }
                     };
@@ -537,7 +565,7 @@ impl FunctionLowerScope {
                         if !ty.is_assignable_to(expected) {
                             eval.emit_type_mismatch_error(
                                 expected,
-                                self.locals.def_loc(r#type),
+                                self.runtime_locals.def_loc(r#type),
                                 ty,
                                 expr_loc,
                             );
@@ -552,7 +580,7 @@ impl FunctionLowerScope {
                     let src_loc = expr.src_loc();
                     match self.translate_expr(eval, expr) {
                         ExprResult::Runtime { expr, ty, comptime: _ } => {
-                            match self.locals.set_from_branch(local, ty, src_loc) {
+                            match self.runtime_locals.set_from_branch(local, ty, src_loc) {
                                 Ok(target) => {
                                     self.instr_buf_stack
                                         .push(mir::Instruction::Set { target, expr });
@@ -571,14 +599,15 @@ impl FunctionLowerScope {
                             }
                         }
                         ExprResult::ComptimeOnly(value) => {
-                            self.locals.set_comptime_only(local, value, src_loc)
+                            self.runtime_locals.register_def_loc(local, src_loc);
+                            self.interpreter.bindings.insert(local, (value, src_loc));
                         }
                     }
                 }
                 hir::InstructionKind::Assign { target, value } => {
                     match self.translate_expr(eval, value) {
                         ExprResult::Runtime { expr, ty, comptime: _ } => {
-                            match self.locals.handle_assign(target, ty) {
+                            match self.runtime_locals.handle_assign(target, ty) {
                                 Ok(mir_target) => {
                                     self.instr_buf_stack
                                         .push(mir::Instruction::Set { target: mir_target, expr });
@@ -586,12 +615,13 @@ impl FunctionLowerScope {
                                 Err(TypeMismatchError { expected_ty, received_ty }) => {
                                     eval.emit_type_mismatch_error(
                                         expected_ty,
-                                        self.locals.def_loc(target),
+                                        self.runtime_locals.def_loc(target),
                                         received_ty,
                                         value.src_loc(),
                                     );
                                 }
                             }
+                            self.interpreter.bindings.remove(target);
                         }
                         ExprResult::ComptimeOnly(_) => {
                             todo!("diagnostic: assigning comptime only value in runtime ctx")
@@ -602,7 +632,7 @@ impl FunctionLowerScope {
                     ExprResult::ComptimeOnly(_) => { /* No MIR equivalent, do nothing */ }
                     ExprResult::Runtime { expr, ty, comptime: _ } => {
                         // MIR doesn't have `Eval` so we use `Set`.
-                        let target = self.locals.alloc_anonymous_mir(ty);
+                        let target = self.runtime_locals.alloc_anonymous_mir(ty);
                         self.instr_buf_stack.push(mir::Instruction::Set { target, expr });
                         if ty == TypeId::NEVER {
                             return Err(BlockControlFlowDiverges);
@@ -616,7 +646,7 @@ impl FunctionLowerScope {
                             todo!("diagnostic: returning comptime-only in runtime ctx")
                         }
                         ExprResult::Runtime { expr, ty, comptime: _ } => {
-                            let temp_store = self.locals.alloc_anonymous_mir(ty);
+                            let temp_store = self.runtime_locals.alloc_anonymous_mir(ty);
                             self.instr_buf_stack
                                 .push(mir::Instruction::Set { target: temp_store, expr });
                             if !ty.is_assignable_to(self.expected_return_type) {
@@ -644,30 +674,30 @@ impl FunctionLowerScope {
                     }
                 }
                 hir::InstructionKind::If { condition, then_block, else_block } => {
-                    match self.locals.comptime(condition) {
+                    match self.comptime_value(condition) {
                         Some(ValueId::TRUE) => self.translate_block_inner(eval, then_block)?,
                         Some(ValueId::FALSE) => self.translate_block_inner(eval, else_block)?,
                         Some(_) => {
-                            let cond_ty = self.locals.get_type(condition, &eval.values);
+                            let cond_ty = self.get_type(condition, &eval.values);
                             eval.emit_type_mismatch_simple(
                                 TypeId::BOOL,
                                 cond_ty,
-                                self.locals.def_loc(condition),
+                                self.runtime_locals.def_loc(condition),
                             );
                             self.translate_block_inner(eval, else_block)?
                         }
                         None => {
-                            let ty = self.locals.get_type(condition, &eval.values);
+                            let ty = self.get_type(condition, &eval.values);
                             if !ty.is_assignable_to(TypeId::BOOL) {
                                 eval.emit_type_mismatch_simple(
                                     TypeId::BOOL,
                                     ty,
-                                    self.locals.def_loc(condition),
+                                    self.runtime_locals.def_loc(condition),
                                 );
                             }
                             let (then_block, then_control) = self.translate_block(eval, then_block);
                             let (else_block, else_control) = self.translate_block(eval, else_block);
-                            let condition = self.locals.hir_to_mir(condition);
+                            let condition = self.runtime_locals.hir_to_mir(condition);
                             self.instr_buf_stack.push(mir::Instruction::If {
                                 condition,
                                 then_block,
@@ -679,20 +709,25 @@ impl FunctionLowerScope {
                         }
                     }
                 }
+                hir::InstructionKind::ComptimeBlock { body } => {
+                    self.interpreter
+                        .interpret_block(eval, body)
+                        .expect("comptime block should not contain `return`");
+                }
                 hir::InstructionKind::While { condition_block, condition, body } => {
                     let (condition_block, cond_control) =
                         self.translate_block(eval, condition_block);
                     let () = cond_control?;
 
-                    let ty = self.locals.get_type(condition, &eval.values);
+                    let ty = self.get_type(condition, &eval.values);
                     if !ty.is_assignable_to(TypeId::BOOL) {
                         eval.emit_type_mismatch_simple(
                             TypeId::BOOL,
                             ty,
-                            self.locals.def_loc(condition),
+                            self.runtime_locals.def_loc(condition),
                         );
                     }
-                    let condition = self.locals.hir_to_mir(condition);
+                    let condition = self.runtime_locals.hir_to_mir(condition);
                     let (body, _) = self.translate_block(eval, body);
                     self.instr_buf_stack.push(mir::Instruction::While {
                         condition_block,
@@ -724,7 +759,7 @@ pub(crate) fn lower_entry_point_as_fn(
     let mut scope = FunctionLowerScope {
         expected_return_type: TypeId::NEVER,
         expected_return_type_loc: None,
-        locals: Locals::default(),
+        runtime_locals: RuntimeLocals::default(),
         interpreter: ComptimeInterpreter::new(),
 
         instr_buf_stack: Vec::with_capacity(INSTRUCTION_BUF_CAPACITY),
@@ -740,7 +775,7 @@ pub(crate) fn lower_entry_point_as_fn(
         todo!("diagnostic: entry point must have an explicit terminator");
     }
 
-    let fn_id1 = eval.mir_fn_locals.push_iter(scope.locals.mir_types());
+    let fn_id1 = eval.mir_fn_locals.push_iter(scope.runtime_locals.mir_types());
     let fn_id2 = eval.mir_fns.push(mir::FnDef { body, param_count: 0, return_type: TypeId::NEVER });
     assert_eq!(fn_id1, fn_id2);
     fn_id1
