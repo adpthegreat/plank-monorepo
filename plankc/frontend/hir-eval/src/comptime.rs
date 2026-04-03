@@ -13,7 +13,7 @@ pub(crate) struct ComptimeInterpreter {
 
     value_buf: VecBuf<ValueId>,
     capture_buf: VecBuf<(ValueId, SrcLoc)>,
-    type_buf: VecBuf<TypeId>,
+    pub(crate) type_buf: VecBuf<TypeId>,
     name_buf: VecBuf<StrId>,
 }
 
@@ -56,7 +56,7 @@ impl ComptimeInterpreter {
         instr: hir::Instruction,
     ) -> Result<(), ReturnValue> {
         match instr.kind {
-            hir::InstructionKind::Set { local, r#type, expr, .. } => {
+            hir::InstructionKind::Set { local, r#type, expr } => {
                 let mut value = self.eval_expr(eval, expr)?;
                 if let Some(r#type) = r#type
                     && value != ValueId::ERROR
@@ -166,8 +166,8 @@ impl ComptimeInterpreter {
                     }
                 }
             }
-            hir::ExprKind::EvmBuiltinCall { .. } => {
-                todo!("comptime builtin eval not yet implemented")
+            hir::ExprKind::EvmBuiltinCall { builtin, args } => {
+                self.eval_evm_builtin(eval, builtin, args, expr.src_loc())
             }
             hir::ExprKind::UnaryOpCall { .. } => todo!("comptime unary op eval"),
             hir::ExprKind::BinaryOpCall { .. } => todo!("comptime binary op eval"),
