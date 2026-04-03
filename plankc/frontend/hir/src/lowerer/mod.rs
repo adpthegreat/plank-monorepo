@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 
 use hashbrown::HashMap;
-use plank_core::{Idx, IncIterable, IndexVec, Span, list_of_lists::ListOfLists};
+use plank_core::{Idx, IncIterable, IndexVec, list_of_lists::ListOfLists};
 use plank_parser::{
     ast::{self, Statement, TopLevelDef},
     cst::{self, NumLitId},
-    lexer::{Lexed, TokenIdx},
+    lexer::{Lexed, TokenSpan},
 };
 use plank_session::{EvmBuiltin, Session, SourceId, SourceSpan, StrId, TypeId};
 use plank_source::project::{FileImport, ImportKind};
@@ -24,7 +24,7 @@ struct ScopedLocal {
     name: StrId,
     id: LocalId,
     mutable: bool,
-    span: Option<Span<TokenIdx>>,
+    span: Option<TokenSpan>,
 }
 
 struct HirBuilder {
@@ -174,7 +174,7 @@ impl BlockLowerer<'_> {
         debug_assert!(self.captures_buf.is_empty());
     }
 
-    fn alloc_local(&mut self, name: StrId, mutable: bool, span: Span<TokenIdx>) -> LocalId {
+    fn alloc_local(&mut self, name: StrId, mutable: bool, span: TokenSpan) -> LocalId {
         if TypeId::resolve_primitive(name).is_some() {
             self.error_shadowing_primitive_type(name, span);
         } else if EvmBuiltin::from_str_id(name).is_some() {
@@ -196,7 +196,7 @@ impl BlockLowerer<'_> {
         self.next_local_id.get_and_inc()
     }
 
-    fn expr(&self, kind: ExprKind, span: Span<TokenIdx>) -> Expr {
+    fn expr(&self, kind: ExprKind, span: TokenSpan) -> Expr {
         Expr { source_id: self.source_id, kind, span: self.lexed.tokens_src_span(span) }
     }
 
@@ -279,7 +279,7 @@ impl BlockLowerer<'_> {
         Self::find_in_scope(&self.scoped_locals_stack[self.fn_scope_start..], name)
     }
 
-    fn lookup_capture(&mut self, name: StrId, use_span: Span<TokenIdx>) -> Option<LocalId> {
+    fn lookup_capture(&mut self, name: StrId, use_span: TokenSpan) -> Option<LocalId> {
         let outer_local =
             Self::find_in_scope(&self.scoped_locals_stack[..self.fn_scope_start], name)?.id;
 
@@ -295,7 +295,7 @@ impl BlockLowerer<'_> {
         Some(inner_local)
     }
 
-    fn emit(&mut self, span: Span<TokenIdx>, kind: InstructionKind) {
+    fn emit(&mut self, span: TokenSpan, kind: InstructionKind) {
         let span = self.lexed.tokens_src_span(span);
         self.instructions_buf.push(Instruction { loc: SrcLoc::new(self.source_id, span), kind });
     }
@@ -304,7 +304,7 @@ impl BlockLowerer<'_> {
         self.builder.blocks.push_iter(self.instructions_buf.drain(start..))
     }
 
-    fn resolve_name(&mut self, name: StrId, span: Span<TokenIdx>) -> ExprKind {
+    fn resolve_name(&mut self, name: StrId, span: TokenSpan) -> ExprKind {
         if let Some(ty) = TypeId::resolve_primitive(name) {
             return ExprKind::Type(ty);
         }
@@ -380,9 +380,11 @@ impl BlockLowerer<'_> {
             ast::Expr::StructLit(struct_lit) => {
                 let ty = self.lower_expr_to_local(struct_lit.type_expr());
                 let buf_start = self.field_buf.len();
-                for field in struct_lit.fields() {
+                for result in struct_lit.fields() {
+                    let Ok(field) = result else { continue };
                     let value = self.lower_expr_to_local(field.value());
-                    self.field_buf.push(FieldInfo { name: field.name, value });
+                    let name_offset = self.lexed.tokens_src_span(field.name_span()).start;
+                    self.field_buf.push(FieldInfo { name: field.name, name_offset, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));
                 ExprKind::StructLit { ty, fields }
@@ -401,9 +403,11 @@ impl BlockLowerer<'_> {
                         local
                     });
                 let buf_start = self.field_buf.len();
-                for field in struct_def.fields() {
+                for result in struct_def.fields() {
+                    let Ok(field) = result else { continue };
                     let value = self.lower_expr_to_local(field.type_expr());
-                    self.field_buf.push(FieldInfo { name: field.name, value });
+                    let name_offset = self.lexed.tokens_src_span(field.name_span()).start;
+                    self.field_buf.push(FieldInfo { name: field.name, name_offset, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));
                 let struct_def_id = self.builder.struct_defs.push(StructDef {
@@ -527,7 +531,8 @@ impl BlockLowerer<'_> {
         let return_type;
         let type_preamble = {
             let preamble_block_start = self.instructions_buf.len();
-            for param in fn_def.params() {
+            for result in fn_def.params() {
+                let Ok(param) = result else { continue };
                 let param_type = self.lower_expr_to_local(param.type_expr());
                 self.locals_buf.push(param_type);
                 let param_value = self.add_param_to_scope_as_local(param);
@@ -538,8 +543,7 @@ impl BlockLowerer<'_> {
         };
 
         let body = self.lower_fn_body_block(fn_def.body());
-        let param_list = fn_def.node().child(0).expect("FnDef missing ParamList");
-        let param_list_span = self.lexed.tokens_src_span(param_list.span());
+        let param_list_span = self.lexed.tokens_src_span(fn_def.param_list_span());
         let fn_def_id = self.builder.fns.push(FnDef {
             type_preamble,
             body,
@@ -552,10 +556,12 @@ impl BlockLowerer<'_> {
             unreachable!("not only pairs?")
         };
         let fn_params_id = self.builder.fn_params.push_iter(
-            type_value_pairs.iter().zip(fn_def.params()).map(|(&[r#type, value], param)| {
-                let span = self.lexed.tokens_src_span(param.node().span());
-                ParamInfo { is_comptime: param.is_comptime, value, r#type, span }
-            }),
+            type_value_pairs.iter().zip(fn_def.params().flatten()).map(
+                |(&[r#type, value], param)| {
+                    let span = self.lexed.tokens_src_span(param.node().span());
+                    ParamInfo { is_comptime: param.is_comptime, value, r#type, span }
+                },
+            ),
         );
         self.locals_buf.truncate(param_locals_start);
         let fn_captures_id =
@@ -594,10 +600,11 @@ impl BlockLowerer<'_> {
     fn lower_else_chain<'cst>(
         &mut self,
         result: LocalId,
-        mut branches: impl Iterator<Item = ast::ElseIfBranch<'cst>>,
-        else_body: Result<ast::BlockExpr<'cst>, Span<TokenIdx>>,
+        mut branches: impl Iterator<Item = Result<ast::ElseIfBranch<'cst>, TokenSpan>>,
+        else_body: Result<ast::BlockExpr<'cst>, TokenSpan>,
     ) -> BlockId {
-        if let Some(first) = branches.next() {
+        while let Some(next) = branches.next() {
+            let Ok(first) = next else { continue };
             return self.create_sub_block(|this| {
                 let span = first.node().span();
                 let condition = this.lower_expr_to_local(first.condition());

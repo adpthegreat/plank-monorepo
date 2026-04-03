@@ -445,9 +445,8 @@ fn test_struct_field_access() {
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: access undefined attribute")]
 fn test_invalid_field_access() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         const Pair = struct { a: u256, b: bool };
 
@@ -457,6 +456,35 @@ fn test_invalid_field_access() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: unknown field
+         --> main.plk:4:19
+          |
+        4 |     let y: u256 = x.hey;
+          |                   ^^^^^ `Pair` has no field `hey`
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_invalid_field_access() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        const p = Pair { a: 42, b: false };
+        const x = p.hey;
+
+        init {
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: unknown field
+         --> main.plk:3:11
+          |
+        3 | const x = p.hey;
+          |           ^^^^^ `Pair` has no field `hey`
+        "#],
     );
 }
 
@@ -488,9 +516,8 @@ fn test_comptime_struct_field_ordering() {
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: literal missing struct field")]
 fn test_comptime_struct_missing_field() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         const Pair = struct { a: u256, b: bool };
         const my_pair = Pair { a: 42 };
@@ -499,13 +526,40 @@ fn test_comptime_struct_missing_field() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: missing field
+         --> main.plk:2:17
+          |
+        2 | const my_pair = Pair { a: 42 };
+          |                 ^^^^^^^^^^^^^^ missing field `b` in `Pair`
+        "#],
     );
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented: diagnostic: duplicate struct field assignment")]
+fn test_comptime_struct_unknown_field() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        const my_pair = Pair { a: 42, c: true, b: false };
+
+        init {
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: unexpected field
+         --> main.plk:2:31
+          |
+        2 | const my_pair = Pair { a: 42, c: true, b: false };
+          |                               ^ `Pair` has no field `c`
+        "#],
+    );
+}
+
+#[test]
 fn test_comptime_struct_duplicate_field() {
-    let _ = try_lower(
+    assert_diagnostics(
         r#"
         const Pair = struct { a: u256, b: bool };
         const my_pair = Pair { a: 42, a: 99, b: false };
@@ -514,6 +568,45 @@ fn test_comptime_struct_duplicate_field() {
             evm_stop();
         }
         "#,
+        &[r#"
+        error: duplicate field
+         --> main.plk:2:31
+          |
+        2 | const my_pair = Pair { a: 42, a: 99, b: false };
+          |                        -      ^ `a` assigned more than once
+          |                        |
+          |                        first assigned here
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_struct_unknown_and_missing() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        const my_pair = Pair { a: 42, c: true };
+
+        init {
+            evm_stop();
+        }
+        "#,
+        &[
+            r#"
+            error: unexpected field
+             --> main.plk:2:31
+              |
+            2 | const my_pair = Pair { a: 42, c: true };
+              |                               ^ `Pair` has no field `c`
+            "#,
+            r#"
+            error: missing field
+             --> main.plk:2:17
+              |
+            2 | const my_pair = Pair { a: 42, c: true };
+              |                 ^^^^^^^^^^^^^^^^^^^^^^^ missing field `b` in `Pair`
+            "#,
+        ],
     );
 }
 
@@ -556,6 +649,27 @@ fn test_comptime_struct_field_type_mismatch() {
           |
         2 | const my_pair = Pair { a: false, b: false };
           |                           ^^^^^ expected `u256`, got `bool`
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_struct_field_not_comptime() {
+    assert_diagnostics(
+        r#"
+        const Wrapper = struct { t: type, n: u256 };
+        init {
+            let x = calldataload(0);
+            let w = Wrapper { t: u256, n: x };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: struct field must be known at compile time
+         --> main.plk:4:35
+          |
+        4 |     let w = Wrapper { t: u256, n: x };
+          |                                   ^ value of `n` is not known at compile time
         "#],
     );
 }
@@ -669,6 +783,46 @@ fn test_runtime_struct_def_field_not_type() {
           |
         2 |     let S = struct { x: 42 };
           |                         ^^ expected type, got value of type `u256`
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_struct_def_type_index_not_comptime() {
+    assert_diagnostics(
+        r#"
+        init {
+            let T = calldataload(0);
+            let S = struct T { x: u256 };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: struct definition requires compile-time values
+         --> main.plk:3:20
+          |
+        3 |     let S = struct T { x: u256 };
+          |                    ^ type index is not known at compile time
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_struct_def_field_type_not_comptime() {
+    assert_diagnostics(
+        r#"
+        init {
+            let T = calldataload(0);
+            let S = struct { x: T };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: struct definition requires compile-time values
+         --> main.plk:3:25
+          |
+        3 |     let S = struct { x: T };
+          |                         ^ field type is not known at compile time
         "#],
     );
 }
@@ -908,6 +1062,68 @@ fn test_runtime_struct_lit_not_a_struct() {
           |
         2 |     let x = u256 { };
           |             ^^^^ `u256` is not a struct type
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_struct_lit_unknown_field() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        init {
+            let x = Pair { a: 42, c: true, b: false };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: unexpected field
+         --> main.plk:3:27
+          |
+        3 |     let x = Pair { a: 42, c: true, b: false };
+          |                           ^ `Pair` has no field `c`
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_struct_lit_duplicate_field() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        init {
+            let x = Pair { a: 42, a: 99, b: false };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: duplicate field
+         --> main.plk:3:27
+          |
+        3 |     let x = Pair { a: 42, a: 99, b: false };
+          |                    -      ^ `a` assigned more than once
+          |                    |
+          |                    first assigned here
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_struct_lit_missing_field() {
+    assert_diagnostics(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        init {
+            let x = Pair { a: 42 };
+            evm_stop();
+        }
+        "#,
+        &[r#"
+        error: missing field
+         --> main.plk:3:13
+          |
+        3 |     let x = Pair { a: 42 };
+          |             ^^^^^^^^^^^^^^ missing field `b` in `Pair`
         "#],
     );
 }

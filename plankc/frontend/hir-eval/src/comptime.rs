@@ -166,8 +166,12 @@ impl ComptimeInterpreter {
                 self.eval_call(eval, callee, args, expr.src_loc())?
             }
             hir::ExprKind::StructDef(struct_def_id) => self.eval_struct_def(eval, struct_def_id)?,
-            hir::ExprKind::StructLit { ty, fields } => self.eval_struct_lit(eval, ty, fields)?,
-            hir::ExprKind::Member { object, member } => self.eval_member(eval, object, member)?,
+            hir::ExprKind::StructLit { ty, fields } => {
+                self.eval_struct_lit(eval, ty, fields, expr.src_loc())?
+            }
+            hir::ExprKind::Member { object, member } => {
+                self.eval_member(eval, object, member, expr.src_loc())?
+            }
             hir::ExprKind::LogicalNot { input } => {
                 let (input_vid, input_loc) = self.bindings[input];
                 match input_vid {
@@ -234,8 +238,7 @@ impl ComptimeInterpreter {
                 }
 
                 eval.types.intern(Type::Struct(StructInfo {
-                    source_id: struct_def.source_id,
-                    source_span: struct_def.source_span,
+                    loc: SrcLoc::new(struct_def.source_id, struct_def.source_span),
                     type_index: type_index_vid,
                     field_types: types,
                     field_names: names,
@@ -251,43 +254,66 @@ impl ComptimeInterpreter {
         eval: &mut Evaluator<'_>,
         ty: hir::LocalId,
         fields_id: hir::FieldsId,
+        lit_loc: SrcLoc,
     ) -> Result<ValueId, ReturnValue> {
         let (type_vid, type_loc) = self.bindings[ty];
+        let lit_fields = &eval.hir.fields[fields_id];
+
+        for (i, field) in lit_fields.iter().enumerate() {
+            let Some(prev) = lit_fields[..i].iter().find(|f| f.name == field.name) else {
+                continue;
+            };
+            eval.emit_struct_duplicate_field(
+                field.name,
+                lit_loc,
+                prev.name_offset,
+                field.name_offset,
+            );
+        }
+
         let Value::Type(struct_type_id) = eval.values.lookup(type_vid) else {
             eval.emit_type_constraint_not_type(eval.values.type_of_value(type_vid), type_loc);
             return Ok(ValueId::ERROR);
         };
-        if !matches!(eval.types.lookup(struct_type_id), Type::Struct(_)) {
-            eval.emit_not_a_struct_type(struct_type_id, type_loc);
-            return Ok(ValueId::ERROR);
-        }
-
-        let fields_info = &eval.hir.fields[fields_id];
-
-        for (i, field) in fields_info.iter().enumerate() {
-            let Type::Struct(r#struct) = eval.types.lookup(struct_type_id) else { unreachable!() };
-            let Some(field_pos) = r#struct.field_names.iter().position(|&name| name == field.name)
-            else {
-                todo!("diagnostic: struct _ has no field named _");
-            };
-            if fields_info[..i].iter().any(|f| f.name == field.name) {
-                todo!("diagnostic: duplicate struct field assignment");
-            }
-            let expected_field_ty = r#struct.field_types[field_pos];
-            let (field_value_vid, field_value_loc) = self.bindings[field.value];
-            let field_value_ty = eval.values.type_of_value(field_value_vid);
-            if !field_value_ty.is_assignable_to(expected_field_ty) {
-                eval.emit_type_mismatch_simple(expected_field_ty, field_value_ty, field_value_loc);
-            }
-        }
-
         self.value_buf.use_as(|fields| {
-            let Type::Struct(r#struct) = eval.types.lookup(struct_type_id) else { unreachable!() };
+            let Type::Struct(r#struct) = eval.types.lookup(struct_type_id) else {
+                eval.emit_not_a_struct_type(struct_type_id, type_loc);
+                return Ok(ValueId::ERROR);
+            };
+            for field in lit_fields {
+                let Some(field_pos) =
+                    r#struct.field_names.iter().position(|&name| name == field.name)
+                else {
+                    eval.emit_struct_lit_unexpected_field(
+                        struct_type_id,
+                        lit_loc,
+                        field.name,
+                        field.name_offset,
+                    );
+                    continue;
+                };
+                let expected_field_ty = r#struct.field_types[field_pos];
+                let (field_value_vid, field_value_loc) = self.bindings[field.value];
+                let field_value_ty = eval.values.type_of_value(field_value_vid);
+                if !field_value_ty.is_assignable_to(expected_field_ty) {
+                    eval.emit_type_mismatch_simple(
+                        expected_field_ty,
+                        field_value_ty,
+                        field_value_loc,
+                    );
+                }
+            }
+            let mut has_missing_fields = false;
             for &field_name in r#struct.field_names {
-                let Some(&field) = fields_info.iter().find(|field| field.name == field_name) else {
-                    todo!("diagnostic: literal missing struct field");
+                let Some(field) = lit_fields.iter().find(|f| f.name == field_name) else {
+                    eval.emit_struct_missing_field(struct_type_id, field_name, lit_loc);
+                    has_missing_fields = true;
+                    continue;
                 };
                 fields.push(self.bindings[field.value].0);
+            }
+            if has_missing_fields {
+                return Ok(ValueId::ERROR);
             }
             Ok(eval.values.intern(Value::StructVal { ty: struct_type_id, fields }))
         })
@@ -298,12 +324,14 @@ impl ComptimeInterpreter {
         eval: &mut Evaluator<'_>,
         object: hir::LocalId,
         member: StrId,
+        expr_loc: SrcLoc,
     ) -> Result<ValueId, ReturnValue> {
         let (obj_vid, obj_loc) = self.bindings[object];
         match eval.values.lookup(obj_vid) {
             Value::StructVal { ty, fields } => {
                 let Some(field_index) = eval.types.field_index_by_name(ty, member) else {
-                    todo!("diagnostic: unknown struct field");
+                    eval.emit_struct_unknown_field_access(ty, expr_loc, member);
+                    return Ok(ValueId::ERROR);
                 };
                 Ok(fields[field_index as usize])
             }

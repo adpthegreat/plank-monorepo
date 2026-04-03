@@ -53,6 +53,11 @@ impl Session {
         &self.name_interner[name]
     }
 
+    pub fn lookup_name_spanned(&self, name: StrId, start: SourceByteOffset) -> (&str, SourceSpan) {
+        let name = &self.name_interner[name];
+        (name, Span::new(start, start + name.len() as u32))
+    }
+
     pub fn next_source(&self) -> SourceId {
         self.source_map.next_idx()
     }

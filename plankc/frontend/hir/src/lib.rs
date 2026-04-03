@@ -1,6 +1,6 @@
 use plank_core::{IndexVec, list_of_lists::ListOfLists, newtype_index};
 use plank_parser::const_print::const_assert_eq;
-use plank_session::{EvmBuiltin, SourceId, SourceSpan, SrcLoc, StrId, TypeId};
+use plank_session::{EvmBuiltin, SourceByteOffset, SourceId, SourceSpan, SrcLoc, StrId, TypeId};
 
 pub use plank_values;
 
@@ -143,6 +143,7 @@ pub struct CaptureInfo {
 #[derive(Debug, Clone, Copy)]
 pub struct FieldInfo {
     pub name: StrId,
+    pub name_offset: SourceByteOffset,
     pub value: LocalId,
 }
 
