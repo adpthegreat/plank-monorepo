@@ -49,6 +49,8 @@ jobs:
       - name: Build
         working-directory: plankc
         run: cargo build --release --package plank --target ${{ matrix.target }}
+        env:
+          PLANK_VERSION: ${{ github.ref_name }}
 
       - name: Package
         run: |

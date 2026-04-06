@@ -8,8 +8,13 @@ use plank_source::source_fs::RealFs;
 use sir_passes::{OPTIMIZE_HELP, parse_optimizations_string};
 use std::path::{Path, PathBuf};
 
+const VERSION: &str = match option_env!("PLANK_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+
 #[derive(Parser)]
-#[command(name = "plank", about = "Plank compiler frontend")]
+#[command(name = "plank", about = "Plank compiler frontend", version = VERSION)]
 struct Args {
     file_path: String,
 
