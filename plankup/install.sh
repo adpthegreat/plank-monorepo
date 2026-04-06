@@ -57,17 +57,19 @@ main() {
 
     # Add to PATH if not already there
     case ":$PATH:" in
-        *":$PLANK_BIN_DIR:"*) ;;
+        *":$PLANK_BIN_DIR:"*)
+            say ""
+            say "run 'plankup' to install or update plank"
+            ;;
         *)
             add_to_path
+            say ""
+            say "detected your preferred shell is $SHELL"
+            say "added \"$PLANK_BIN_DIR\" to PATH in your shell profile"
+            say ""
+            say "run 'source $SHELL_PROFILE' or open a new terminal, then run 'plankup' to install plank"
             ;;
     esac
-
-    say ""
-    say "detected your preferred shell is $SHELL"
-    say "added \"$PLANK_BIN_DIR\" to PATH in your shell profile"
-    say ""
-    say "run 'source $SHELL_PROFILE' or open a new terminal, then run 'plankup' to install plank"
 }
 
 main

@@ -8,6 +8,8 @@ REPO="plankevm/plank-monorepo"
 GITHUB_API="https://api.github.com/repos/$REPO/releases"
 GITHUB_DOWNLOAD="https://github.com/$REPO/releases/download"
 
+TMPDIR_CLEANUP=""
+
 say() { printf "plankup: %s\n" "$1"; }
 warn() { say "warning: $1" >&2; }
 err() { say "error: $1" >&2; exit 1; }
@@ -151,7 +153,8 @@ main() {
     # Set up temp directory for download
     local tmpdir
     tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
+    TMPDIR_CLEANUP="$tmpdir"
+    trap 'rm -rf "$TMPDIR_CLEANUP"' EXIT
 
     local asset_name="plank-${version}-${PLATFORM}-${ARCH}.tar.gz"
     local download_url="$GITHUB_DOWNLOAD/$version/$asset_name"
