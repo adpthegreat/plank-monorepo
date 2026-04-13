@@ -1,21 +1,20 @@
-use plank_core::{IndexVec, list_of_lists::ListOfLists, newtype_index};
-use plank_parser::const_print::const_assert_eq;
-use plank_session::{EvmBuiltin, SourceByteOffset, SourceId, SourceSpan, SrcLoc, StrId, TypeId};
-
-pub use plank_values;
+use plank_core::{
+    IndexVec, const_print::const_assert_mem_size, list_of_lists::ListOfLists, newtype_index,
+};
+use plank_session::{
+    EvmBuiltin, MaybePoisoned, Poisoned, SourceByteOffset, SourceId, SourceSpan, SrcLoc, StrId,
+};
 
 pub mod display;
 mod lowerer;
 pub mod operators;
 
 pub use lowerer::lower;
-pub use plank_values::{BigNumId, BigNumInterner};
+pub use plank_values::{ConstId, FnDefId, ValueId};
 
 newtype_index! {
-    pub struct ConstId;
     pub struct LocalId;
     pub struct BlockId;
-    pub struct FnDefId;
     pub struct StructDefId;
     pub struct CallArgsId;
     pub struct FieldsId;
@@ -23,15 +22,8 @@ newtype_index! {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Expr {
-    pub source_id: SourceId,
     pub span: SourceSpan,
     pub kind: ExprKind,
-}
-
-impl Expr {
-    pub fn src_loc(&self) -> SrcLoc {
-        SrcLoc::new(self.source_id, self.span)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,11 +31,7 @@ pub enum ExprKind {
     ConstRef(ConstId),
     LocalRef(LocalId),
     FnDef(FnDefId),
-
-    Bool(bool),
-    Void,
-    BigNum(BigNumId),
-    Type(TypeId),
+    Value(MaybePoisoned<ValueId>),
 
     Call {
         callee: LocalId,
@@ -77,17 +65,21 @@ pub enum ExprKind {
     LogicalNot {
         input: LocalId,
     },
-
-    /// Indicates the expr that evaluated to the value had some error that was already handled,
-    /// to avoid cascades any expression downstream from it also needs to become an error.
-    Error,
 }
 
-/// [`ExprKind`] memory size check. May be changed intentionally.
-const _EXPR_KIND_SIZE: () = const_assert_eq(std::mem::size_of::<ExprKind>(), 12);
+impl ExprKind {
+    pub const VOID: Self = ExprKind::Value(Ok(ValueId::VOID));
+    pub const POISON: Self = ExprKind::Value(Err(Poisoned));
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum InstructionKind {
+    Param {
+        comptime: bool,
+        arg: LocalId,
+        r#type: LocalId,
+        idx: u32,
+    },
     Set {
         local: LocalId,
         r#type: Option<LocalId>,
@@ -97,9 +89,14 @@ pub enum InstructionKind {
         local: LocalId,
         expr: Expr,
     },
+    SetMut {
+        local: LocalId,
+        r#type: Option<LocalId>,
+        expr: Expr,
+    },
     Assign {
         target: LocalId,
-        value: Expr,
+        expr: Expr,
     },
     Eval(Expr),
     Return(Expr),
@@ -121,9 +118,14 @@ pub enum InstructionKind {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Instruction {
-    pub loc: SrcLoc,
     pub kind: InstructionKind,
 }
+
+// Memory size checks. Remember size impacts performance. May be changed intentionally.
+const _EXPR_KIND_SIZE: () = const_assert_mem_size::<ExprKind>(12);
+const _EXPR_SIZE: () = const_assert_mem_size::<Expr>(20);
+const _INSTR_KIND_SIZE: () = const_assert_mem_size::<InstructionKind>(32);
+const _INSTR_SIZE: () = const_assert_mem_size::<Instruction>(32);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ParamInfo {
@@ -159,6 +161,12 @@ pub struct FnDef {
     pub param_list_span: SourceSpan,
 }
 
+impl FnDef {
+    pub fn loc(&self, span: SourceSpan) -> SrcLoc {
+        SrcLoc::new(self.source, span)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StructDef {
     pub source_id: SourceId,
@@ -176,12 +184,20 @@ pub struct ConstDef {
     pub result: LocalId,
 }
 
+impl ConstDef {
+    pub fn loc(&self) -> SrcLoc {
+        SrcLoc::new(self.source_id, self.source_span)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Hir {
+    pub entry_source: SourceId,
     pub init: BlockId,
     pub run: Option<BlockId>,
 
-    pub blocks: ListOfLists<BlockId, Instruction>,
+    pub block_instrs: ListOfLists<BlockId, Instruction>,
+    pub block_spans: IndexVec<BlockId, MaybePoisoned<SourceSpan>>,
     pub consts: IndexVec<ConstId, ConstDef>,
 
     pub call_args: ListOfLists<CallArgsId, LocalId>,

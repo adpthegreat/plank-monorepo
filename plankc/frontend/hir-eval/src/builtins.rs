@@ -1,236 +1,176 @@
-use alloy_primitives::{U256, uint};
-use plank_hir::{self as hir, CallArgsId};
-use plank_session::{EvmBuiltin, SrcLoc};
-use plank_values::ValueId;
+use alloy_primitives::U256;
+use plank_hir as hir;
+use plank_mir as mir;
+use plank_session::{EvmBuiltin, MaybePoisoned, SourceSpan};
+use plank_values::{TypeId, Value, ValueId, ValueInterner};
 
-use crate::{ComptimeInterpreter, Evaluator, value::Value};
+use crate::scope::{Diverge, EvalValue, LocalState, Scope};
+use plank_session::Poisoned;
 
-trait InternableValue {
-    fn intern(self, eval: &mut Evaluator<'_>) -> ValueId;
-}
-
-impl InternableValue for bool {
-    fn intern(self, _eval: &mut Evaluator<'_>) -> ValueId {
-        if self { ValueId::TRUE } else { ValueId::FALSE }
+fn as_u256(values: &ValueInterner, vid: ValueId) -> U256 {
+    match values.lookup(vid) {
+        Value::BigNum(n) => n,
+        other => unreachable!("expected U256 value, got {other:?}"),
     }
 }
 
-impl InternableValue for U256 {
-    fn intern(self, eval: &mut Evaluator<'_>) -> ValueId {
-        let id = eval.big_nums.intern(self);
-        eval.values.intern_num(id)
-    }
-}
+pub(crate) fn fold_pure_builtin(
+    builtin: EvmBuiltin,
+    args: &[ValueId],
+    values: &mut ValueInterner,
+) -> ValueId {
+    use EvmBuiltin::*;
 
-impl ComptimeInterpreter {
-    pub(crate) fn eval_evm_builtin(
-        &mut self,
-        eval: &mut Evaluator<'_>,
-        builtin: EvmBuiltin,
-        args: CallArgsId,
-        loc: SrcLoc,
-    ) -> ValueId {
-        let arg_locals = &eval.hir.call_args[args];
-
-        let arg_types_valid = self.type_buf.use_as(|arg_types| {
-            for &local in arg_locals {
-                arg_types.push(eval.values.type_of_value(self.bindings[local].0));
+    match *args {
+        [a] => {
+            let a = as_u256(values, a);
+            match builtin {
+                IsZero => plank_evm::iszero(a).into(),
+                Not => values.intern_num(plank_evm::not(a)),
+                _ => unreachable!("not a unary pure builtin: {builtin}"),
             }
-            'sig: for &(input_types, _result_type) in builtin.signatures() {
-                if input_types.len() != arg_types.len() {
-                    continue 'sig;
-                }
-                for (&expected, &actual) in input_types.iter().zip(arg_types.iter()) {
-                    if !actual.is_assignable_to(expected) {
-                        continue 'sig;
+        }
+        [a, b] => {
+            let a = as_u256(values, a);
+            let b = as_u256(values, b);
+            match builtin {
+                Add => values.intern_num(plank_evm::add(a, b)),
+                Mul => values.intern_num(plank_evm::mul(a, b)),
+                Sub => values.intern_num(plank_evm::sub(a, b)),
+                Div => values.intern_num(plank_evm::div(a, b)),
+                SDiv => values.intern_num(plank_evm::sdiv(a, b)),
+                Mod => values.intern_num(plank_evm::r#mod(a, b)),
+                SMod => values.intern_num(plank_evm::smod(a, b)),
+                Exp => values.intern_num(plank_evm::exp(a, b)),
+                SignExtend => values.intern_num(plank_evm::signextend(a, b)),
+                Lt => plank_evm::lt(a, b).into(),
+                Gt => plank_evm::gt(a, b).into(),
+                SLt => plank_evm::slt(a, b).into(),
+                SGt => plank_evm::sgt(a, b).into(),
+                Eq => plank_evm::eq(a, b).into(),
+                And => values.intern_num(plank_evm::and(a, b)),
+                Or => values.intern_num(plank_evm::or(a, b)),
+                Xor => values.intern_num(plank_evm::xor(a, b)),
+                Byte => values.intern_num(plank_evm::byte(a, b)),
+                Shl => values.intern_num(plank_evm::shl(a, b)),
+                Shr => values.intern_num(plank_evm::shr(a, b)),
+                Sar => values.intern_num(plank_evm::sar(a, b)),
+                _ => unreachable!("not a binary pure builtin: {builtin}"),
+            }
+        }
+        [a, b, c] => {
+            let a = as_u256(values, a);
+            let b = as_u256(values, b);
+            let c = as_u256(values, c);
+            match builtin {
+                AddMod => values.intern_num(plank_evm::addmod(a, b, c)),
+                MulMod => values.intern_num(plank_evm::mulmod(a, b, c)),
+                _ => unreachable!("not a ternary pure builtin: {builtin}"),
+            }
+        }
+        _ => unreachable!("impure builtin cannot be evaluated: {builtin}"),
+    }
+}
+
+impl Scope<'_, '_> {
+    pub(crate) fn eval_builtin(
+        &mut self,
+        builtin: EvmBuiltin,
+        args: hir::CallArgsId,
+        expr_span: SourceSpan,
+    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
+        let args = &self.hir.call_args[args];
+        let expr_loc = self.loc(expr_span);
+
+        let result_type = self.with_types_buf(|this, types_buf_offset| {
+            for &arg in args {
+                let ty = this.state_type(this.bindings[arg].state?);
+                this.eval.types_buf.push(ty);
+            }
+            let arg_types = &this.eval.types_buf[types_buf_offset..];
+
+            builtin.resolve_result_type(arg_types).ok_or_else(|| {
+                this.diag_ctx.emit_no_matching_builtin_signature(
+                    &this.eval.types,
+                    builtin,
+                    &this.eval.types_buf[types_buf_offset..],
+                    expr_loc,
+                );
+                Poisoned
+            })
+        })?;
+
+        if builtin.is_pure() {
+            let folded = self.with_values_buf(|this, values_buf_offset| {
+                for &arg in args {
+                    let (state, arg_def_span) = this.bindings[arg]
+                        .poisoned()
+                        .expect("invariant: arg type check checks poison");
+                    match state {
+                        LocalState::Comptime(vid) => this.values_buf.push(vid),
+                        LocalState::Runtime(_) if this.is_comptime() => {
+                            this.diag_ctx.emit_runtime_ref_in_comptime(
+                                this.source,
+                                expr_span,
+                                arg_def_span,
+                            );
+                            return Err(Poisoned);
+                        }
+                        LocalState::Runtime(_) => return Ok(None),
                     }
                 }
-                return true;
+                Ok(Some(fold_pure_builtin(
+                    builtin,
+                    &this.eval.values_buf[values_buf_offset..],
+                    this.eval.values,
+                )))
+            })?;
+            if let Some(value) = folded {
+                return Ok(Ok(EvalValue::Comptime(value)));
             }
-            eval.emit_no_matching_builtin_signature(builtin, arg_types, loc);
-            false
+        } else {
+            if self.is_comptime() {
+                self.diag_ctx.emit_unsupported_eval_of_evm_builtin(builtin, expr_loc);
+                if result_type == TypeId::NEVER {
+                    return Ok(Err(Diverge::PoisonedControlFlow));
+                } else {
+                    return Err(Poisoned);
+                }
+            }
+        }
+
+        let args = self.with_locals_buf(|this, locals_buf_offset| {
+            for &arg in args {
+                let state =
+                    this.bindings[arg].state.expect("invariant: arg type check checks poison");
+                let arg = match state {
+                    LocalState::Comptime(vid) => {
+                        assert!(
+                            !this.is_comptime_only(vid),
+                            "evm builtin typechecks for comptime only value"
+                        );
+                        let target = this.mir_types.push(this.values.type_of_value(vid));
+                        this.emit(plank_mir::Instruction::Set {
+                            target,
+                            expr: mir::Expr::Const(vid),
+                        });
+                        target
+                    }
+                    LocalState::Runtime(local) => local,
+                };
+                this.locals_buf.push(arg);
+            }
+            this.eval.mir_args.push_copy_slice(&this.eval.locals_buf[locals_buf_offset..])
         });
 
-        match builtin {
-            // Non-pure: cannot be evaluated at comptime
-            EvmBuiltin::Keccak256
-            | EvmBuiltin::Address
-            | EvmBuiltin::Balance
-            | EvmBuiltin::Origin
-            | EvmBuiltin::Caller
-            | EvmBuiltin::CallValue
-            | EvmBuiltin::CallDataLoad
-            | EvmBuiltin::CallDataSize
-            | EvmBuiltin::CallDataCopy
-            | EvmBuiltin::CodeSize
-            | EvmBuiltin::CodeCopy
-            | EvmBuiltin::GasPrice
-            | EvmBuiltin::ExtCodeSize
-            | EvmBuiltin::ExtCodeCopy
-            | EvmBuiltin::ReturnDataSize
-            | EvmBuiltin::ReturnDataCopy
-            | EvmBuiltin::ExtCodeHash
-            | EvmBuiltin::Gas
-            | EvmBuiltin::BlockHash
-            | EvmBuiltin::Coinbase
-            | EvmBuiltin::Timestamp
-            | EvmBuiltin::Number
-            | EvmBuiltin::Difficulty
-            | EvmBuiltin::GasLimit
-            | EvmBuiltin::ChainId
-            | EvmBuiltin::SelfBalance
-            | EvmBuiltin::BaseFee
-            | EvmBuiltin::BlobHash
-            | EvmBuiltin::BlobBaseFee
-            | EvmBuiltin::SLoad
-            | EvmBuiltin::SStore
-            | EvmBuiltin::TLoad
-            | EvmBuiltin::TStore
-            | EvmBuiltin::Log0
-            | EvmBuiltin::Log1
-            | EvmBuiltin::Log2
-            | EvmBuiltin::Log3
-            | EvmBuiltin::Log4
-            | EvmBuiltin::Create
-            | EvmBuiltin::Create2
-            | EvmBuiltin::Call
-            | EvmBuiltin::CallCode
-            | EvmBuiltin::DelegateCall
-            | EvmBuiltin::StaticCall
-            | EvmBuiltin::Return
-            | EvmBuiltin::Stop
-            | EvmBuiltin::Revert
-            | EvmBuiltin::Invalid
-            | EvmBuiltin::SelfDestruct
-            | EvmBuiltin::DynamicAllocZeroed
-            | EvmBuiltin::DynamicAllocAnyBytes
-            | EvmBuiltin::MemoryCopy
-            | EvmBuiltin::MLoad1
-            | EvmBuiltin::MLoad2
-            | EvmBuiltin::MLoad3
-            | EvmBuiltin::MLoad4
-            | EvmBuiltin::MLoad5
-            | EvmBuiltin::MLoad6
-            | EvmBuiltin::MLoad7
-            | EvmBuiltin::MLoad8
-            | EvmBuiltin::MLoad9
-            | EvmBuiltin::MLoad10
-            | EvmBuiltin::MLoad11
-            | EvmBuiltin::MLoad12
-            | EvmBuiltin::MLoad13
-            | EvmBuiltin::MLoad14
-            | EvmBuiltin::MLoad15
-            | EvmBuiltin::MLoad16
-            | EvmBuiltin::MLoad17
-            | EvmBuiltin::MLoad18
-            | EvmBuiltin::MLoad19
-            | EvmBuiltin::MLoad20
-            | EvmBuiltin::MLoad21
-            | EvmBuiltin::MLoad22
-            | EvmBuiltin::MLoad23
-            | EvmBuiltin::MLoad24
-            | EvmBuiltin::MLoad25
-            | EvmBuiltin::MLoad26
-            | EvmBuiltin::MLoad27
-            | EvmBuiltin::MLoad28
-            | EvmBuiltin::MLoad29
-            | EvmBuiltin::MLoad30
-            | EvmBuiltin::MLoad31
-            | EvmBuiltin::MLoad32
-            | EvmBuiltin::MStore1
-            | EvmBuiltin::MStore2
-            | EvmBuiltin::MStore3
-            | EvmBuiltin::MStore4
-            | EvmBuiltin::MStore5
-            | EvmBuiltin::MStore6
-            | EvmBuiltin::MStore7
-            | EvmBuiltin::MStore8
-            | EvmBuiltin::MStore9
-            | EvmBuiltin::MStore10
-            | EvmBuiltin::MStore11
-            | EvmBuiltin::MStore12
-            | EvmBuiltin::MStore13
-            | EvmBuiltin::MStore14
-            | EvmBuiltin::MStore15
-            | EvmBuiltin::MStore16
-            | EvmBuiltin::MStore17
-            | EvmBuiltin::MStore18
-            | EvmBuiltin::MStore19
-            | EvmBuiltin::MStore20
-            | EvmBuiltin::MStore21
-            | EvmBuiltin::MStore22
-            | EvmBuiltin::MStore23
-            | EvmBuiltin::MStore24
-            | EvmBuiltin::MStore25
-            | EvmBuiltin::MStore26
-            | EvmBuiltin::MStore27
-            | EvmBuiltin::MStore28
-            | EvmBuiltin::MStore29
-            | EvmBuiltin::MStore30
-            | EvmBuiltin::MStore31
-            | EvmBuiltin::MStore32
-            | EvmBuiltin::RuntimeStartOffset
-            | EvmBuiltin::InitEndOffset
-            | EvmBuiltin::RuntimeLength => {
-                eval.emit_unsupported_eval_of_evm_builtin(builtin, loc);
-                ValueId::ERROR
-            }
-            _ if !arg_types_valid => ValueId::ERROR,
-            EvmBuiltin::Add => self.eval_u256_binop(eval, arg_locals, plank_evm::add),
-            EvmBuiltin::Mul => self.eval_u256_binop(eval, arg_locals, plank_evm::mul),
-            EvmBuiltin::Sub => self.eval_u256_binop(eval, arg_locals, plank_evm::sub),
-            EvmBuiltin::Div => self.eval_u256_binop(eval, arg_locals, plank_evm::div),
-            EvmBuiltin::SDiv => self.eval_u256_binop(eval, arg_locals, plank_evm::sdiv),
-            EvmBuiltin::Mod => self.eval_u256_binop(eval, arg_locals, plank_evm::r#mod),
-            EvmBuiltin::SMod => self.eval_u256_binop(eval, arg_locals, plank_evm::smod),
-            EvmBuiltin::Exp => self.eval_u256_binop(eval, arg_locals, plank_evm::exp),
-            EvmBuiltin::SignExtend => self.eval_u256_binop(eval, arg_locals, plank_evm::signextend),
-            EvmBuiltin::And => self.eval_u256_binop(eval, arg_locals, plank_evm::and),
-            EvmBuiltin::Or => self.eval_u256_binop(eval, arg_locals, plank_evm::or),
-            EvmBuiltin::Xor => self.eval_u256_binop(eval, arg_locals, plank_evm::xor),
-            EvmBuiltin::Byte => self.eval_u256_binop(eval, arg_locals, plank_evm::byte),
-            EvmBuiltin::Shl => self.eval_u256_binop(eval, arg_locals, plank_evm::shl),
-            EvmBuiltin::Shr => self.eval_u256_binop(eval, arg_locals, plank_evm::shr),
-            EvmBuiltin::Sar => self.eval_u256_binop(eval, arg_locals, plank_evm::sar),
-            EvmBuiltin::AddMod => {
-                self.eval_u256_op(eval, arg_locals, |[a, b, n]| plank_evm::addmod(a, b, n))
-            }
-            EvmBuiltin::MulMod => {
-                self.eval_u256_op(eval, arg_locals, |[a, b, n]| plank_evm::mulmod(a, b, n))
-            }
-            EvmBuiltin::Lt => self.eval_u256_binop(eval, arg_locals, plank_evm::lt),
-            EvmBuiltin::Gt => self.eval_u256_binop(eval, arg_locals, plank_evm::gt),
-            EvmBuiltin::SLt => self.eval_u256_binop(eval, arg_locals, plank_evm::slt),
-            EvmBuiltin::SGt => self.eval_u256_binop(eval, arg_locals, plank_evm::sgt),
-            EvmBuiltin::Eq => self.eval_u256_binop(eval, arg_locals, plank_evm::eq),
-            EvmBuiltin::IsZero => self.eval_u256_op(eval, arg_locals, |[a]| plank_evm::iszero(a)),
-            EvmBuiltin::Not => self.eval_u256_op(eval, arg_locals, |[a]| plank_evm::not(a)),
+        let expr = mir::Expr::BuiltinCall { builtin, args };
+        if result_type == TypeId::NEVER {
+            // We diverge after this so we need to make sure the call is actually included.
+            let target = self.mir_types.push(result_type);
+            self.emit(mir::Instruction::Set { target, expr });
+            return Ok(Err(Diverge::BlockEnd(None)));
         }
-    }
 
-    fn eval_u256_binop<R: InternableValue>(
-        &self,
-        eval: &mut Evaluator<'_>,
-        locals: &[hir::LocalId],
-        op: impl FnOnce(U256, U256) -> R,
-    ) -> ValueId {
-        self.eval_u256_op(eval, locals, |[a, b]| op(a, b))
-    }
-
-    fn eval_u256_op<R: InternableValue, const N: usize>(
-        &self,
-        eval: &mut Evaluator<'_>,
-        locals: &[hir::LocalId],
-        op: impl FnOnce([U256; N]) -> R,
-    ) -> ValueId {
-        let mut args = [uint!(0U256); N];
-        for i in 0..N {
-            let (vid, _loc) = self.bindings[locals[i]];
-            args[i] = match eval.values.lookup(vid) {
-                Value::BigNum(id) => eval.big_nums[id],
-                non_num => unreachable!("unexpected non-num value post sig validation {non_num:?}"),
-            };
-        }
-        op(args).intern(eval)
+        Ok(Ok(EvalValue::Runtime { expr, result_type }))
     }
 }

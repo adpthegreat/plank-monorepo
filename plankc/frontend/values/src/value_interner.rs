@@ -1,8 +1,7 @@
+use crate::{DefOrigin, FnDefId, TypeId, ValueId, bignum_interner::*};
+use alloy_primitives::U256;
 use hashbrown::{DefaultHashBuilder, HashTable, hash_table::Entry};
 use plank_core::{IndexVec, list_of_lists::ListOfLists, newtype_index};
-use plank_hir::FnDefId;
-use plank_session::SrcLoc;
-use plank_values::{BigNumId, TypeId, ValueId};
 use std::hash::BuildHasher;
 
 newtype_index! {
@@ -12,7 +11,6 @@ newtype_index! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredValue {
-    Error,
     Void,
     Bool(bool),
     BigNum(BigNumId),
@@ -22,20 +20,18 @@ enum StoredValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Value<'a> {
-    Error,
+pub enum Value<'a> {
     Void,
     Bool(bool),
-    BigNum(BigNumId),
+    BigNum(U256),
     Type(TypeId),
-    Closure { fn_def: FnDefId, captures: &'a [(ValueId, SrcLoc)] },
+    Closure { fn_def: FnDefId, captures: &'a [(ValueId, DefOrigin)] },
     StructVal { ty: TypeId, fields: &'a [ValueId] },
 }
 
 impl Value<'_> {
     pub fn get_type(&self) -> TypeId {
         match self {
-            Value::Error => TypeId::ERROR,
             Value::Void => TypeId::VOID,
             Value::Bool(_) => TypeId::BOOL,
             Value::BigNum(_) => TypeId::U256,
@@ -46,24 +42,31 @@ impl Value<'_> {
     }
 }
 
-pub(crate) struct ValueInterner {
+pub struct ValueInterner {
     values: IndexVec<ValueId, StoredValue>,
     dedup: HashTable<ValueId>,
     hasher: DefaultHashBuilder,
     children: ListOfLists<CompoundIdx, ValueId>,
-    captures: ListOfLists<CaptureIdx, (ValueId, SrcLoc)>,
+    captures: ListOfLists<CaptureIdx, (ValueId, DefOrigin)>,
+    big_nums: BigNumInterner,
+}
+
+impl Default for ValueInterner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn stored_to_value<'a>(
     stored: StoredValue,
     children: &'a ListOfLists<CompoundIdx, ValueId>,
-    captures: &'a ListOfLists<CaptureIdx, (ValueId, SrcLoc)>,
+    captures: &'a ListOfLists<CaptureIdx, (ValueId, DefOrigin)>,
+    big_nums: &'a BigNumInterner,
 ) -> Value<'a> {
     match stored {
-        StoredValue::Error => Value::Error,
         StoredValue::Void => Value::Void,
         StoredValue::Bool(b) => Value::Bool(b),
-        StoredValue::BigNum(n) => Value::BigNum(n),
+        StoredValue::BigNum(bid) => Value::BigNum(big_nums.lookup(bid)),
         StoredValue::Type(t) => Value::Type(t),
         StoredValue::Closure { fn_def, captures: idx } => {
             Value::Closure { fn_def, captures: &captures[idx] }
@@ -82,11 +85,11 @@ impl ValueInterner {
             hasher: DefaultHashBuilder::default(),
             children: ListOfLists::new(),
             captures: ListOfLists::new(),
+            big_nums: BigNumInterner::new(),
         };
         assert_eq!(new_interner.intern(Value::Void), ValueId::VOID);
         assert_eq!(new_interner.intern(Value::Bool(false)), ValueId::FALSE);
         assert_eq!(new_interner.intern(Value::Bool(true)), ValueId::TRUE);
-        assert_eq!(new_interner.intern(Value::Error), ValueId::ERROR);
         new_interner
     }
 
@@ -98,7 +101,7 @@ impl ValueInterner {
         self.lookup(value).get_type()
     }
 
-    pub fn intern_num(&mut self, num: BigNumId) -> ValueId {
+    pub fn intern_num(&mut self, num: U256) -> ValueId {
         self.intern(Value::BigNum(num))
     }
 
@@ -110,12 +113,16 @@ impl ValueInterner {
         let hash = self.hash_value(value);
         let entry = self.dedup.entry(
             hash,
-            |&id| stored_to_value(self.values[id], &self.children, &self.captures) == value,
+            |&id| {
+                stored_to_value(self.values[id], &self.children, &self.captures, &self.big_nums)
+                    == value
+            },
             |&id| {
                 self.hasher.hash_one(stored_to_value(
                     self.values[id],
                     &self.children,
                     &self.captures,
+                    &self.big_nums,
                 ))
             },
         );
@@ -123,10 +130,9 @@ impl ValueInterner {
             Entry::Occupied(occupied) => *occupied.get(),
             Entry::Vacant(vacant) => {
                 let stored = match value {
-                    Value::Error => StoredValue::Error,
                     Value::Void => StoredValue::Void,
                     Value::Bool(b) => StoredValue::Bool(b),
-                    Value::BigNum(n) => StoredValue::BigNum(n),
+                    Value::BigNum(n) => StoredValue::BigNum(self.big_nums.intern(n)),
                     Value::Type(t) => StoredValue::Type(t),
                     Value::Closure { fn_def, captures } => StoredValue::Closure {
                         fn_def,
@@ -145,13 +151,14 @@ impl ValueInterner {
     }
 
     pub fn lookup(&self, id: ValueId) -> Value<'_> {
-        stored_to_value(self.values[id], &self.children, &self.captures)
+        stored_to_value(self.values[id], &self.children, &self.captures, &self.big_nums)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::uint;
 
     #[test]
     fn intern_primitives_dedup() {
@@ -184,16 +191,16 @@ mod tests {
     #[test]
     fn lookup_roundtrip() {
         let mut interner = ValueInterner::new();
-        let v = interner.intern(Value::BigNum(BigNumId::new(0)));
-        assert_eq!(interner.lookup(v), Value::BigNum(BigNumId::new(0)));
+        let v = interner.intern(Value::BigNum(uint!(67_U256)));
+        assert_eq!(interner.lookup(v), Value::BigNum(uint!(67_U256)));
     }
 
     #[test]
     fn intern_num_identical_to_intern() {
         let mut interner = ValueInterner::new();
-        let num_id = BigNumId::new(42);
-        let via_intern = interner.intern(Value::BigNum(num_id));
-        let via_intern_num = interner.intern_num(num_id);
+        let num = uint!(420_U256);
+        let via_intern = interner.intern(Value::BigNum(num));
+        let via_intern_num = interner.intern_num(num);
         assert_eq!(via_intern, via_intern_num);
     }
 

@@ -1,5 +1,5 @@
-use hashbrown::{DefaultHashBuilder, HashTable, hash_table::Entry};
-use plank_core::{DenseIndexSet, Idx, IndexVec, list_of_lists::ListOfLists, newtype_index};
+use hashbrown::{DefaultHashBuilder, HashSet, HashTable, hash_table::Entry};
+use plank_core::{Idx, IndexVec, list_of_lists::ListOfLists, newtype_index};
 use plank_session::{Session, SrcLoc, StrId, TypeId, builtins::builtin_names};
 use std::{fmt, hash::BuildHasher};
 
@@ -11,17 +11,16 @@ newtype_index! {
 
 #[derive(Debug, Clone, Copy)]
 pub struct StructExtraInfo {
-    pub loc: SrcLoc,
+    pub def_loc: SrcLoc,
     pub type_index: ValueId,
     pub name: Option<StrId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StructInfo<'a> {
-    pub loc: SrcLoc,
+    pub def_loc: SrcLoc,
     pub type_index: ValueId,
-    pub field_types: &'a [TypeId],
-    pub field_names: &'a [StrId],
+    pub fields: &'a [(StrId, TypeId)],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,7 +32,6 @@ pub enum Type<'fields> {
     Type,
     Function,
     Never,
-    Error,
     Struct(StructInfo<'fields>),
 }
 
@@ -46,19 +44,15 @@ fn get_primitive_id(ty: Type<'_>) -> Result<TypeId, StructInfo<'_>> {
         Type::Type => Ok(TypeId::TYPE),
         Type::Function => Ok(TypeId::FUNCTION),
         Type::Never => Ok(TypeId::NEVER),
-        Type::Error => Ok(TypeId::ERROR),
         Type::Struct(r#struct) => Err(r#struct),
     }
 }
 
 const fn comptime_only_primitive(ty: TypeId) -> Result<bool, StructIdx> {
     match ty {
-        TypeId::VOID
-        | TypeId::U256
-        | TypeId::BOOL
-        | TypeId::NEVER
-        | TypeId::MEMORY_POINTER
-        | TypeId::ERROR => Ok(false),
+        TypeId::VOID | TypeId::U256 | TypeId::BOOL | TypeId::NEVER | TypeId::MEMORY_POINTER => {
+            Ok(false)
+        }
         TypeId::TYPE | TypeId::FUNCTION => Ok(true),
         _ => Err(StructIdx::new(ty.const_get() - TypeId::STRUCT_IDS_OFFSET)),
     }
@@ -73,7 +67,6 @@ const fn as_type(ty: TypeId) -> Result<Type<'static>, StructIdx> {
         TypeId::TYPE => Ok(Type::Type),
         TypeId::FUNCTION => Ok(Type::Function),
         TypeId::NEVER => Ok(Type::Never),
-        TypeId::ERROR => Ok(Type::Error),
         _ => Err(StructIdx::new(ty.const_get() - TypeId::STRUCT_IDS_OFFSET)),
     }
 }
@@ -92,9 +85,8 @@ pub struct TypeInterner {
 
 #[derive(Debug)]
 struct StructStorage {
-    comptime_only: DenseIndexSet<StructIdx>,
-    struct_fields: ListOfLists<StructIdx, TypeId>,
-    struct_field_names: ListOfLists<StructIdx, StrId>,
+    comptime_only: HashSet<StructIdx>,
+    struct_fields: ListOfLists<StructIdx, (StrId, TypeId)>,
     index_to_struct: IndexVec<StructIdx, StructExtraInfo>,
     hasher: DefaultHashBuilder,
 }
@@ -109,9 +101,8 @@ impl TypeInterner {
     pub fn new() -> Self {
         Self {
             storage: StructStorage {
-                comptime_only: DenseIndexSet::new(),
+                comptime_only: HashSet::new(),
                 struct_fields: Default::default(),
-                struct_field_names: Default::default(),
                 index_to_struct: Default::default(),
                 hasher: Default::default(),
             },
@@ -122,9 +113,8 @@ impl TypeInterner {
     pub fn with_capacity(structs: usize, fields: usize) -> Self {
         Self {
             storage: StructStorage {
-                comptime_only: DenseIndexSet::with_capacity_in_bits(structs),
+                comptime_only: HashSet::with_capacity(structs),
                 struct_fields: ListOfLists::with_capacities(structs, fields),
-                struct_field_names: ListOfLists::with_capacities(structs, fields),
                 index_to_struct: IndexVec::with_capacity(structs),
                 hasher: Default::default(),
             },
@@ -149,25 +139,21 @@ impl TypeInterner {
         match entry {
             Entry::Occupied(occupied) => (*occupied.get()).into(),
             Entry::Vacant(vacant) => {
-                let field_struct_idx =
-                    self.storage.struct_fields.push_copy_slice(r#struct.field_types);
-                let name_struct_idx =
-                    self.storage.struct_field_names.push_copy_slice(r#struct.field_names);
+                let field_struct_idx = self.storage.struct_fields.push_copy_slice(r#struct.fields);
                 let new_struct_idx = self.storage.index_to_struct.push(StructExtraInfo {
-                    loc: r#struct.loc,
+                    def_loc: r#struct.def_loc,
                     type_index: r#struct.type_index,
                     name: None,
                 });
 
-                for &ty in r#struct.field_types {
+                for &(_name, ty) in r#struct.fields {
                     if self.storage.comptime_only(ty) {
-                        self.storage.comptime_only.add(new_struct_idx);
+                        self.storage.comptime_only.insert(new_struct_idx);
                         break;
                     }
                 }
 
-                debug_assert_eq!(new_struct_idx, field_struct_idx);
-                debug_assert_eq!(new_struct_idx, name_struct_idx);
+                assert_eq!(new_struct_idx, field_struct_idx);
                 vacant.insert(new_struct_idx);
                 new_struct_idx.into()
             }
@@ -196,13 +182,16 @@ impl TypeInterner {
             Type::Type => f.write_str(builtin_names::TYPE),
             Type::Function => f.write_str(builtin_names::FUNCTION),
             Type::Never => f.write_str(builtin_names::NEVER),
-            Type::Error => f.write_str("<error>"),
             Type::Struct(info) => match self.struct_name(type_id) {
                 Some(name) => f.write_str(session.lookup_name(name)),
                 None => {
                     let (line, col) =
-                        session.offset_to_line_col(info.loc.source, info.loc.span.start);
-                    write!(f, "struct@{line}:{col}")
+                        session.offset_to_line_col(info.def_loc.source, info.def_loc.span.start);
+                    write!(
+                        f,
+                        "struct@{}:{line}:{col}",
+                        &session.get_source(info.def_loc.source).path.to_str().unwrap()
+                    )
                 }
             },
         }
@@ -214,11 +203,11 @@ impl TypeInterner {
         buf
     }
 
-    pub fn field_index_by_name(&self, type_id: TypeId, name: StrId) -> Option<u32> {
+    pub fn field_index_by_name(&self, type_id: TypeId, target_name: StrId) -> Option<u32> {
         let struct_idx = as_type(type_id).err()?;
-        self.storage.struct_field_names[struct_idx]
+        self.storage.struct_fields[struct_idx]
             .iter()
-            .position(|&n| n == name)
+            .position(|&(field_name, _ty)| field_name == target_name)
             .map(|i| i as u32)
     }
 
@@ -246,10 +235,9 @@ impl StructStorage {
     fn get_info(&self, idx: StructIdx) -> StructInfo<'_> {
         let stored = &self.index_to_struct[idx];
         StructInfo {
-            loc: stored.loc,
+            def_loc: stored.def_loc,
             type_index: stored.type_index,
-            field_types: &self.struct_fields[idx],
-            field_names: &self.struct_field_names[idx],
+            fields: &self.struct_fields[idx],
         }
     }
 
@@ -266,7 +254,7 @@ impl StructStorage {
             Ok(comptime_only) => return comptime_only,
             Err(struct_idx) => struct_idx,
         };
-        self.comptime_only.contains(struct_idx)
+        self.comptime_only.contains(&struct_idx)
     }
 }
 

@@ -76,6 +76,12 @@ impl<I: Idx, V> DenseIndexMap<I, V> {
         unsafe { self.inner.get_unchecked_mut(key.idx()) }.replace(value)
     }
 
+    #[track_caller]
+    pub fn insert_no_prev(&mut self, key: I, value: V) {
+        let prev = self.insert(key, value);
+        assert!(prev.is_none(), "inserting but not first");
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (I, &V)> {
         self.inner
             .iter()
@@ -117,8 +123,16 @@ impl<I: Idx, V: std::fmt::Debug> std::fmt::Debug for DenseIndexMap<I, V> {
 impl<I: Idx, V> std::ops::Index<I> for DenseIndexMap<I, V> {
     type Output = V;
 
+    #[track_caller]
     fn index(&self, index: I) -> &Self::Output {
         self.get(index).expect("index out of bounds")
+    }
+}
+
+impl<I: Idx, V> std::ops::IndexMut<I> for DenseIndexMap<I, V> {
+    #[track_caller]
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        self.get_mut(index).expect("index out of bounds")
     }
 }
 

@@ -1,18 +1,20 @@
 use crate::{ArgsId, BlockId, Expr, FnId, Instruction, LocalId, Mir};
 use plank_core::Idx;
 use plank_session::Session;
-use plank_values::{BigNumInterner, TypeId};
+use plank_values::{TypeId, Value, ValueId, ValueInterner, uint};
 use std::fmt::{self, Display, Formatter};
 
 pub struct DisplayMir<'a> {
     mir: &'a Mir,
-    big_nums: &'a BigNumInterner,
+    values: &'a ValueInterner,
     session: &'a Session,
 }
 
+const PAD: &str = "    ";
+
 impl<'a> DisplayMir<'a> {
-    pub fn new(mir: &'a Mir, big_nums: &'a BigNumInterner, session: &'a Session) -> Self {
-        Self { mir, big_nums, session }
+    pub fn new(mir: &'a Mir, values: &'a ValueInterner, session: &'a Session) -> Self {
+        Self { mir, values, session }
     }
 
     fn fmt_type(&self, f: &mut Formatter<'_>, type_id: TypeId) -> fmt::Result {
@@ -35,13 +37,40 @@ impl<'a> DisplayMir<'a> {
         write!(f, "%{}", local.get())
     }
 
+    fn fmt_value(&self, f: &mut Formatter<'_>, vid: ValueId, indent: usize) -> fmt::Result {
+        match self.values.lookup(vid) {
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::BigNum(x) => {
+                if x < uint!(100_000_U256) {
+                    write!(f, "{x}")
+                } else {
+                    write!(f, "{x:x}")
+                }
+            }
+            Value::Void => write!(f, "void_unit"),
+            Value::StructVal { ty, fields } => {
+                write!(f, "struct#{} {{", ty.get())?;
+                if !fields.is_empty() {
+                    writeln!(f)?;
+                }
+                let pad = PAD.repeat(indent);
+                for &field in fields {
+                    write!(f, "{pad}{PAD}")?;
+                    self.fmt_value(f, field, indent + 1)?;
+                    writeln!(f, ",")?;
+                }
+                write!(f, "{pad}}}")
+            }
+            Value::Type(_) | Value::Closure { .. } => {
+                unreachable!("comptime-only value in MIR")
+            }
+        }
+    }
+
     fn fmt_expr(&self, f: &mut Formatter<'_>, expr: Expr) -> fmt::Result {
         match expr {
             Expr::LocalRef(local) => self.fmt_local(f, local),
-            Expr::Bool(b) => write!(f, "{b}"),
-            Expr::Void => write!(f, "unit"),
-            Expr::Error => write!(f, "<error>"),
-            Expr::BigNum(id) => write!(f, "{}", self.big_nums[id]),
+            Expr::Const(vid) => self.fmt_value(f, vid, 1),
             Expr::Call { callee, args } => {
                 write!(f, "call @fn{}", callee.get())?;
                 self.fmt_args(f, args)
@@ -80,7 +109,7 @@ impl<'a> DisplayMir<'a> {
         instr: Instruction,
         indent: usize,
     ) -> fmt::Result {
-        let pad = "    ".repeat(indent);
+        let pad = PAD.repeat(indent);
         match instr {
             Instruction::Set { target: local, expr } => {
                 write!(f, "{pad}")?;

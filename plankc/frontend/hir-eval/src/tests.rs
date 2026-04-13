@@ -1,17 +1,14 @@
 use plank_mir::{Mir, display::DisplayMir};
 use plank_session::Session;
 use plank_test_utils::{TestProject, dedent_preserve_blank_lines};
-use plank_values::BigNumInterner;
+use plank_values::ValueInterner;
 
-fn try_lower(source: &str) -> (Mir, BigNumInterner, Session) {
-    try_lower_project(TestProject::single(source))
-}
-
-fn try_lower_project(project: TestProject) -> (Mir, BigNumInterner, Session) {
+fn try_lower(project: impl Into<TestProject>) -> (Mir, ValueInterner, Session) {
+    let project = project.into();
     let mut session = Session::new();
     let project = project.build(&mut session);
 
-    let mut big_nums = BigNumInterner::default();
+    let mut big_nums = ValueInterner::new();
     let hir = plank_hir::lower(&project, &mut big_nums, &mut session);
     let mir = crate::evaluate(&hir, &mut big_nums, &mut session);
 
@@ -20,6 +17,13 @@ fn try_lower_project(project: TestProject) -> (Mir, BigNumInterner, Session) {
 
 fn assert_lowers_to(source: &str, expected: &str) {
     let (mir, big_nums, session) = try_lower(source);
+
+    if session.has_errors() {
+        let diags: Vec<String> =
+            session.diagnostics().iter().map(|d| d.render_plain(&session)).collect();
+        panic!("expected no diagnostics but got {}:\n{}", diags.len(), diags.join("\n---\n"));
+    }
+
     let actual = format!("{}", DisplayMir::new(&mir, &big_nums, &session));
     let expected = dedent_preserve_blank_lines(expected);
 
@@ -27,14 +31,16 @@ fn assert_lowers_to(source: &str, expected: &str) {
 }
 
 fn render_project_diagnostics(test_project: TestProject) -> Vec<String> {
-    let (_, _, session) = try_lower_project(test_project);
+    let (_, _, session) = try_lower(test_project);
     session.diagnostics().iter().map(|d| d.render_plain(&session)).collect()
 }
 
+#[track_caller]
 fn assert_diagnostics(source: &str, expected: &[&str]) {
-    assert_project_diagnostics(TestProject::single(source), expected)
+    assert_project_diagnostics(TestProject::root(source), expected)
 }
 
+#[track_caller]
 fn assert_project_diagnostics(test_project: TestProject, expected: &[&str]) {
     let actual = render_project_diagnostics(test_project);
     let expected: Vec<String> =
@@ -100,6 +106,125 @@ fn test_type_annotation_type_mismatch() {
 }
 
 #[test]
+fn test_no_else_if_as_expr() {
+    assert_lowers_to(
+        "
+        init {
+            let cond = calldataload(0);
+            let y = if iszero(cond) {
+                revert(malloc_uninit(0), 0);
+            } else if gt(cond, 2) {
+                sstore(3, 4);
+            };
+            evm_stop();
+        }
+        ",
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 0
+            %1 : u256 = calldataload(%0)
+            %2 : u256 = %1
+            %3 : bool = iszero(%2)
+            if %3 {
+                %4 : u256 = 0
+                %5 : memptr = malloc_uninit(%4)
+                %6 : u256 = 0
+                %7 : never = revert(%5, %6)
+            } else {
+                %8 : u256 = %1
+                %9 : u256 = 2
+                %10 : bool = gt(%8, %9)
+                if %10 {
+                    %11 : u256 = 3
+                    %12 : u256 = 4
+                    %13 : void = sstore(%11, %12)
+                    %14 : void = void_unit
+                } else {
+                    %14 : void = void_unit
+                }
+            }
+            %15 : void = %14
+            %16 : never = evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_comptime_if_condition_folds_in_runtime() {
+    assert_lowers_to(
+        "
+        init {
+            let cond = false;
+            if cond {
+                revert(malloc_uninit(0), 0);
+            } else {
+                sstore(3, 4);
+            }
+            evm_stop();
+        }
+        ",
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 3
+            %1 : u256 = 4
+            %2 : void = sstore(%0, %1)
+            %3 : void = void_unit
+            %4 : void = %3
+            %5 : never = evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_if_three_branches() {
+    assert_lowers_to(
+        "
+        init {
+            let c = calldataload(0);
+            let x = if slt(c, 0)  {
+                334
+            } else if iszero(c) {
+                333
+            } else {
+                0
+            };
+            evm_stop();
+        }
+        ",
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 0
+            %1 : u256 = calldataload(%0)
+            %2 : u256 = %1
+            %3 : u256 = 0
+            %4 : bool = slt(%2, %3)
+            if %4 {
+                %5 : u256 = 334
+            } else {
+                %6 : u256 = %1
+                %7 : bool = iszero(%6)
+                if %7 {
+                    %5 : u256 = 333
+                } else {
+                    %5 : u256 = 0
+                }
+            }
+            %8 : u256 = %5
+            %9 : never = evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
 fn test_if_two_branches_type_mismatch() {
     assert_diagnostics(
         "
@@ -142,28 +267,16 @@ fn test_if_three_branches_type_mismatch() {
             evm_stop();
         }
         ",
-        &[
-            r#"
-                error: `if` and `else` have incompatible types
-                 --> main.plk:6:9
-                  |
-                4 |         3
-                  |         - `u256` expected because of this
-                5 |     } else if eq(c, 34) {
-                6 |         false
-                  |         ^^^^^ expected `u256`, got `bool`
-            "#,
-            r#"
-                error: `if` and `else` have incompatible types
-                 --> main.plk:8:9
-                  |
-                4 |         3
-                  |         - `u256` expected because of this
-                ...
-                8 |         true
-                  |         ^^^^ expected `u256`, got `bool`
-            "#,
-        ],
+        &[r#"
+            error: `if` and `else` have incompatible types
+             --> main.plk:6:9
+              |
+            4 |         3
+              |         - `u256` expected because of this
+            5 |     } else if eq(c, 34) {
+            6 |         false
+              |         ^^^^^ expected `u256`, got `bool`
+            "#],
     );
 }
 
@@ -199,19 +312,27 @@ fn test_if_type_mismatch() {
 }
 
 #[test]
-#[should_panic(
-    expected = "not yet implemented: diagnostic: entry point must have an explicit terminator"
-)]
 fn test_run_missing_termination() {
-    let _ = try_lower(
+    assert_diagnostics(
         "
-            init {
-                evm_stop();
-            }
-            run {
-                let x = 5;
-            }
+        init {
+            evm_stop();
+        }
+        run {
+            let x = 5;
+        }
         ",
+        &[r#"
+        error: entry point must end with explicit terminator
+         --> main.plk:4:1
+          |
+        4 | / run {
+        5 | |     let x = 5;
+        6 | | }
+          | |_^ execution may reach end of entry point
+          |
+          = help: entry points must end with a terminating `never` expression (e.g. `evm_stop()`, `revert(...)`, `invalid()`)
+        "#],
     );
 }
 
@@ -357,12 +478,12 @@ fn test_if_mixed_never_and_value_branches() {
             %2 : u256 = %1
             %3 : bool = iszero(%2)
             if %3 {
-                %4 : u256 = evm_stop()
+                %4 : never = evm_stop()
             } else {
-                %4 : u256 = 42
+                %5 : u256 = 42
             }
-            %5 : u256 = %4
-            %6 : never = evm_stop()
+            %6 : u256 = %5
+            %7 : never = evm_stop()
         }
         "#,
     );
@@ -410,12 +531,12 @@ fn test_struct_field_access() {
 
         init {
             let x = Pair { b: false, a : 34 };
-            let y: u256 = x.a;
-            let z: bool = x.b;
+            let mut y: u256 = x.a;
+            let mut z: bool = x.b;
 
-            let p = Pair { a: 49, b: true };
-            let pa = p.a;
-            let pb = p.b;
+            let mut p = Pair { a: 49, b: true };
+            let mut pa = p.a;
+            let mut pb = p.b;
 
             evm_stop();
         }
@@ -424,21 +545,17 @@ fn test_struct_field_access() {
         ==== Functions ====
         ; init
         @fn0() -> never {
-            %0 : bool = false
-            %1 : u256 = 34
-            %2 : Pair = Pair { %1, %0 }
+            %0 : u256 = 34
+            %1 : bool = false
+            %2 : Pair = struct#7 {
+                49,
+                true,
+            }
             %3 : Pair = %2
             %4 : u256 = %3.0
             %5 : Pair = %2
             %6 : bool = %5.1
-            %7 : u256 = 49
-            %8 : bool = true
-            %9 : Pair = Pair { %7, %8 }
-            %10 : Pair = %9
-            %11 : u256 = %10.0
-            %12 : Pair = %9
-            %13 : bool = %12.1
-            %14 : never = evm_stop()
+            %7 : never = evm_stop()
         }
         "#,
     );
@@ -498,8 +615,8 @@ fn test_comptime_struct_field_ordering() {
         const b_val = my_pair.b;
 
         init {
-            let x: u256 = a_val;
-            let y: bool = b_val;
+            let mut x: u256 = a_val;
+            let mut y: bool = b_val;
             evm_stop();
         }
         "#,
@@ -644,33 +761,50 @@ fn test_comptime_struct_field_type_mismatch() {
         }
         "#,
         &[r#"
-        error: mismatched types
+        error: incorrect type for struct field
          --> main.plk:2:27
           |
         2 | const my_pair = Pair { a: false, b: false };
-          |                           ^^^^^ expected `u256`, got `bool`
+          |                           ^^^^^ field `a` expects `u256`, got `bool`
         "#],
     );
 }
 
 #[test]
-fn test_comptime_struct_field_not_comptime() {
+fn test_mixed_comptime_runtime_struct() {
     assert_diagnostics(
         r#"
         const Wrapper = struct { t: type, n: u256 };
         init {
             let x = calldataload(0);
-            let w = Wrapper { t: u256, n: x };
+            let w = Wrapper { t: u256, n: x,
+                c: 34
+            };
             evm_stop();
         }
         "#,
-        &[r#"
-        error: struct field must be known at compile time
-         --> main.plk:4:35
-          |
-        4 |     let w = Wrapper { t: u256, n: x };
-          |                                   ^ value of `n` is not known at compile time
-        "#],
+        &[
+            r#"
+            error: unexpected field
+             --> main.plk:5:9
+              |
+            5 |         c: 34
+              |         ^ `Wrapper` has no field `c`
+            "#,
+            r#"
+            error: mixing comptime and runtime data in struct
+             --> main.plk:4:13
+              |
+            4 |       let w = Wrapper { t: u256, n: x,
+              |               ^         -        - `n` not comptime known
+              |               |         |
+              |  _____________|         `t` is comptime only
+              | |
+            5 | |         c: 34
+            6 | |     };
+              | |_____^ mixed struct literal
+            "#,
+        ],
     );
 }
 
@@ -759,7 +893,7 @@ fn test_struct_type_not_comptime_known() {
         }
         "#,
         &[r#"
-        error: struct type must be known at compile time
+        error: type must be known at compile time
          --> main.plk:3:13
           |
         3 |     let x = T { };
@@ -818,11 +952,11 @@ fn test_runtime_struct_def_field_type_not_comptime() {
         }
         "#,
         &[r#"
-        error: struct definition requires compile-time values
+        error: type must be known at compile time
          --> main.plk:3:25
           |
         3 |     let S = struct { x: T };
-          |                         ^ field type is not known at compile time
+          |                         ^ not known at compile time
         "#],
     );
 }
@@ -918,18 +1052,23 @@ fn test_runtime_return_type_mismatch() {
 fn test_comptime_if_condition_not_bool() {
     assert_diagnostics(
         r#"
-        const f = fn() u256 {
-            if 42 { return 1; } else { return 2; }
-        };
-        const r = f();
-        init { evm_stop(); }
+        init {
+            comptime {
+                if 42 {
+                    add(3, 4);
+                } else {
+                    iszero(34);
+                }
+            }
+            evm_stop();
+        }
         "#,
         &[r#"
         error: mismatched types
-         --> main.plk:2:8
+         --> main.plk:3:12
           |
-        2 |     if 42 { return 1; } else { return 2; }
-          |        ^^ expected `bool`, got `u256`
+        3 |         if 42 {
+          |            ^^ expected `bool`, got `u256`
         "#],
     );
 }
@@ -945,11 +1084,11 @@ fn test_runtime_struct_lit_field_type_mismatch() {
         }
         "#,
         &[r#"
-        error: mismatched types
+        error: incorrect type for struct field
          --> main.plk:3:23
           |
         3 |     let x = Pair { a: false, b: false };
-          |                       ^^^^^ expected `u256`, got `bool`
+          |                       ^^^^^ field `a` expects `u256`, got `bool`
         "#],
     );
 }
@@ -967,6 +1106,8 @@ fn test_runtime_call_arg_type_mismatch() {
         error: mismatched types
          --> main.plk:3:7
           |
+        2 |     let f = fn(x: u256) never { evm_stop(); };
+          |                   ---- `u256` expected because of this
         3 |     f(false);
           |       ^^^^^ expected `u256`, got `bool`
         "#],
@@ -1294,7 +1435,7 @@ fn test_comptime_call_arg_count_mismatch() {
 #[test]
 fn test_cross_file_call_arg_count_mismatch() {
     assert_project_diagnostics(
-        TestProject::single("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
+        TestProject::root("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
             .add_file("other", "const f = fn(x: u256) u256 { return x; };")
             .add_module("m", ""),
         &[r#"
@@ -1369,9 +1510,9 @@ fn test_closure_capture_not_comptime() {
          --> main.plk:3:25
           |
         2 |     let x = calldataload(0);
-          |             --------------- not known at compile time
+          |             --------------- defined here
         3 |     let f = fn() u256 { x };
-          |                         ^ captures a runtime value
+          |                         ^ capture of runtime value
           |
           = note: closures can only capture values known at compile time
         "#],
@@ -1411,7 +1552,7 @@ fn test_logical_not_comptime_true() {
         r#"
         const x = !true;
         init {
-            let v: bool = x;
+            let mut v: bool = x;
             evm_stop();
         }
         "#,
@@ -1432,7 +1573,7 @@ fn test_logical_not_comptime_false() {
         r#"
         const x = !false;
         init {
-            let v: bool = x;
+            let mut v: bool = x;
             evm_stop();
         }
         "#,
@@ -1527,7 +1668,7 @@ fn test_and_comptime_short_circuit_false() {
         r#"
         const x = false and true;
         init {
-            let v: bool = x;
+            let mut v: bool = x;
             evm_stop();
         }
         "#,
@@ -1613,32 +1754,32 @@ fn test_comptime_evm_builtins() {
         const addmod_res = raw_addmod(5, 7, 10);
         const mulmod_res = raw_mulmod(3, 4, 5);
         init {
-            let a: u256 = add_res;
-            let b: u256 = mul_res;
-            let c: u256 = sub_res;
-            let d: u256 = div_res;
-            let e: u256 = mod_res;
-            let f: u256 = sdiv_res;
-            let g: u256 = smod_res;
-            let h: u256 = exp_res;
-            let i: u256 = div_zero;
-            let j: u256 = signext_res;
-            let k: u256 = and_res;
-            let l: u256 = or_res;
-            let m: u256 = xor_res;
-            let n: u256 = byte_res;
-            let o: u256 = shl_res;
-            let p: u256 = shr_res;
-            let q: u256 = sar_res;
-            let r: bool = lt_res;
-            let s: bool = gt_res;
-            let t: bool = slt_res;
-            let u: bool = sgt_res;
-            let v: bool = eq_res;
-            let w: bool = iszero_t;
-            let x: bool = iszero_f;
-            let y: u256 = addmod_res;
-            let z: u256 = mulmod_res;
+            let mut a: u256 = add_res;
+            let mut b: u256 = mul_res;
+            let mut c: u256 = sub_res;
+            let mut d: u256 = div_res;
+            let mut e: u256 = mod_res;
+            let mut f: u256 = sdiv_res;
+            let mut g: u256 = smod_res;
+            let mut h: u256 = exp_res;
+            let mut i: u256 = div_zero;
+            let mut j: u256 = signext_res;
+            let mut k: u256 = and_res;
+            let mut l: u256 = or_res;
+            let mut m: u256 = xor_res;
+            let mut n: u256 = byte_res;
+            let mut o: u256 = shl_res;
+            let mut p: u256 = shr_res;
+            let mut q: u256 = sar_res;
+            let mut r: bool = lt_res;
+            let mut s: bool = gt_res;
+            let mut t: bool = slt_res;
+            let mut u: bool = sgt_res;
+            let mut v: bool = eq_res;
+            let mut w: bool = iszero_t;
+            let mut x: bool = iszero_f;
+            let mut y: u256 = addmod_res;
+            let mut z: u256 = mulmod_res;
             evm_stop();
         }
         "#,
@@ -1685,7 +1826,7 @@ fn test_comptime_evm_const_chain() {
         const a = add(5, 10);
         const b = mul(a, 3);
         init {
-            let x: u256 = b;
+            let mut x: u256 = b;
             evm_stop();
         }
         "#,
@@ -1708,7 +1849,7 @@ fn test_comptime_unsupported_evm_builtin() {
         init { evm_stop(); }
         "#,
         &[r#"
-        error: comptime evaluation not supported
+        error: builtin not supported at compile time
          --> main.plk:1:11
           |
         1 | const x = caller();
@@ -1742,7 +1883,7 @@ fn test_comptime_block_multi_statement() {
         r#"
         init {
             let y = 15;
-            let x: u256 = comptime {
+            let mut x: u256 = comptime {
                 let mut a = 10;
                 let b = 20;
                 a = y;
@@ -1756,8 +1897,7 @@ fn test_comptime_block_multi_statement() {
         ; init
         @fn0() -> never {
             %0 : u256 = 15
-            %1 : u256 = 15
-            %2 : never = evm_stop()
+            %1 : never = evm_stop()
         }
         "#,
     );
@@ -1769,7 +1909,7 @@ fn test_comptime_block_with_const_ref() {
         r#"
         const N = 42;
         init {
-            let x: u256 = comptime { N };
+            let mut x: u256 = comptime { N };
             evm_stop();
         }
         "#,
@@ -1791,7 +1931,7 @@ fn test_out_of_order_const_ref() {
         const B = comptime { A };
         const A = 34;
         init {
-            let x: u256 = comptime { B };
+            let mut x: u256 = comptime { B };
             evm_stop();
         }
         "#,
@@ -1813,7 +1953,7 @@ fn test_comptime_block_nested_const() {
         const A = 10;
         const B = comptime { A };
         init {
-            let x: u256 = comptime { B };
+            let mut x: u256 = comptime { B };
             evm_stop();
         }
         "#,
@@ -1836,7 +1976,7 @@ fn test_comptime_block_struct_type() {
             let T = comptime {
                 struct { x: u256 }
             };
-            let val = T { x: 42 };
+            let mut val = T { x: 42 };
             evm_stop();
         }
         "#,
@@ -1844,9 +1984,10 @@ fn test_comptime_block_struct_type() {
         ==== Functions ====
         ; init
         @fn0() -> never {
-            %0 : u256 = 42
-            %1 : struct@3:9 = struct@3:9 { %0 }
-            %2 : never = evm_stop()
+            %0 : struct@main.plk:3:9 = struct#7 {
+                42,
+            }
+            %1 : never = evm_stop()
         }
         "#,
     );
@@ -1863,14 +2004,81 @@ fn test_comptime_block_runtime_capture() {
         }
         "#,
         &[r#"
-        error: comptime block capture must be known at compile time
+        error: attempting to evaluate runtime expression in comptime context
          --> main.plk:3:24
           |
         3 |     let y = comptime { x };
-          |                        ^ not known at compile time
-          |
-          = note: comptime blocks can only reference values known at compile time
+          |                        ^ runtime expression
         "#],
+    );
+}
+
+#[test]
+fn test_comptime_expr_runtime_dep() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = iszero(calldataload(0));
+            let T = if cond { u256 } else { bool };
+            evm_stop();
+        }
+        "#,
+        &[
+            r#"
+        error: use of comptime only value at runtime
+         --> main.plk:3:23
+          |
+        3 |     let T = if cond { u256 } else { bool };
+          |                       ^^^^ reference to comptime only value
+          |
+          = info: `let mut` definitions and mutable assignments require runtime-compatible values
+        "#,
+            r#"
+        error: use of comptime only value at runtime
+         --> main.plk:3:37
+          |
+        3 |     let T = if cond { u256 } else { bool };
+          |                                     ^^^^ reference to comptime only value
+          |
+          = info: `let mut` definitions and mutable assignments require runtime-compatible values
+        "#,
+        ],
+    );
+}
+
+#[test]
+fn test_comptime_recursion() {
+    assert_lowers_to(
+        r#"
+        const fib_inner = fn (n: u256, a: u256, b: u256) u256 {
+            if iszero(n) {
+                return a;
+            }
+            fib_inner(sub(n, 1), b, add(a, b))
+        };
+        const fib = fn (n: u256) u256 {
+            fib_inner(n, 0, 1)
+        };
+
+        init {
+            let mut f0 = comptime { fib(0) };
+            let mut f1 = comptime { fib(1) };
+            let mut f10 = comptime { fib(10) };
+            let mut f10 = comptime { fib(11) };
+            evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 0
+            %1 : u256 = 1
+            %2 : u256 = 55
+            %3 : u256 = 89
+            %4 : never = evm_stop()
+        }
+        "#,
     );
 }
 
@@ -1879,7 +2087,7 @@ fn test_comptime_block_type_result() {
     assert_lowers_to(
         r#"
         init {
-            let x: comptime { u256 } = 5;
+            let mut x: comptime { u256 } = 5;
             evm_stop();
         }
         "#,
@@ -1891,5 +2099,66 @@ fn test_comptime_block_type_result() {
             %1 : never = evm_stop()
         }
         "#,
+    );
+}
+
+#[test]
+fn test_struct_def_duplicate_field() {
+    assert_diagnostics(
+        r#"
+        const S = struct { x: u256, x: bool };
+        init { evm_stop(); }
+        "#,
+        &[r#"
+        error: duplicate field name in struct definition
+         --> main.plk:1:29
+          |
+        1 | const S = struct { x: u256, x: bool };
+          |                    -        ^ `x` assigned more than once
+          |                    |
+          |                    first assigned here
+        "#],
+    );
+}
+
+#[test]
+fn test_const_self_cycle() {
+    assert_diagnostics(
+        r#"
+        const A = {
+            let x = 67;
+            A
+        };
+
+        init { evm_stop(); }
+        "#,
+        &[r#"
+        error: cycle in constant evaluation
+         --> main.plk:1:1
+          |
+        1 | / const A = {
+        2 | |     let x = 67;
+        3 | |     A
+        4 | | };
+          | |__^ `A` depends on itself
+        "#],
+    );
+}
+
+#[test]
+fn test_const_mutual_cycle() {
+    assert_diagnostics(
+        r#"
+           const A = B;
+           const B = A;
+           init { evm_stop(); }
+           "#,
+        &[r#"
+        error: cycle in constant evaluation
+         --> main.plk:1:1
+          |
+        1 | const A = B;
+          | ^^^^^^^^^^^^ `A` depends on itself
+        "#],
     );
 }

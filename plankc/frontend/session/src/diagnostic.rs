@@ -73,6 +73,18 @@ pub struct SrcLoc {
     pub span: SourceSpan,
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct Tracked<T> {
+    pub inner: T,
+    pub loc: SrcLoc,
+}
+
+impl<T> Tracked<T> {
+    pub fn new(inner: T, loc: SrcLoc) -> Self {
+        Self { inner, loc }
+    }
+}
+
 impl SrcLoc {
     pub fn new(source: SourceId, span: SourceSpan) -> Self {
         Self { source, span }
@@ -142,27 +154,56 @@ pub struct Claim {
     pub elements: Vec<Element>,
 }
 
+pub trait ClaimBuilder: Sized {
+    fn element(self, element: impl Into<Element>) -> Self;
+
+    fn cross_source_annotations(
+        self,
+        primary_loc: SrcLoc,
+        primary_label: impl Into<String>,
+        secondary_loc: SrcLoc,
+        secondary_label: impl Into<String>,
+    ) -> Self {
+        if primary_loc.source == secondary_loc.source {
+            self.element(
+                Annotations::new(primary_loc.source)
+                    .primary(primary_loc.span, primary_label)
+                    .secondary(secondary_loc.span, secondary_label),
+            )
+        } else {
+            self.primary(primary_loc.source, primary_loc.span, primary_label).element(
+                Annotations::new(secondary_loc.source)
+                    .secondary(secondary_loc.span, secondary_label),
+            )
+        }
+    }
+
+    fn primary(self, source_id: SourceId, span: SourceSpan, label: impl Into<String>) -> Self {
+        self.element(Annotations::new(source_id).primary(span, label))
+    }
+
+    fn note(self, message: impl Into<String>) -> Self {
+        self.element(Element::Message { level: Some(Level::Note), text: message.into() })
+    }
+
+    fn help(self, message: impl Into<String>) -> Self {
+        self.element(Element::Message { level: Some(Level::Help), text: message.into() })
+    }
+
+    fn info(self, message: impl Into<String>) -> Self {
+        self.element(Element::Message { level: Some(Level::Info), text: message.into() })
+    }
+}
+
 impl Claim {
     pub fn new(level: Level, title: impl Into<String>) -> Self {
         Self { level, title: title.into(), elements: Vec::new() }
     }
+}
 
-    pub fn element(mut self, element: impl Into<Element>) -> Self {
+impl ClaimBuilder for Claim {
+    fn element(mut self, element: impl Into<Element>) -> Self {
         self.elements.push(element.into());
-        self
-    }
-
-    pub fn primary(self, source_id: SourceId, span: SourceSpan, label: impl Into<String>) -> Self {
-        self.element(Annotations::new(source_id).primary(span, label))
-    }
-
-    pub fn note(mut self, message: impl Into<String>) -> Self {
-        self.elements.push(Element::Message { level: Some(Level::Note), text: message.into() });
-        self
-    }
-
-    pub fn help(mut self, message: impl Into<String>) -> Self {
-        self.elements.push(Element::Message { level: Some(Level::Help), text: message.into() });
         self
     }
 }
@@ -173,6 +214,13 @@ pub struct Diagnostic {
     pub title: String,
     pub primary_elements: Vec<Element>,
     pub added_claims: Vec<Claim>,
+}
+
+impl ClaimBuilder for Diagnostic {
+    fn element(mut self, element: impl Into<Element>) -> Self {
+        self.primary_elements.push(element.into());
+        self
+    }
 }
 
 impl Diagnostic {
@@ -198,49 +246,7 @@ impl Diagnostic {
         }
     }
 
-    pub fn element(mut self, element: impl Into<Element>) -> Self {
-        self.primary_elements.push(element.into());
-        self
-    }
-
-    pub fn primary(self, source_id: SourceId, span: SourceSpan, label: impl Into<String>) -> Self {
-        self.element(Annotations::new(source_id).primary(span, label))
-    }
-
-    pub fn cross_source_annotations(
-        self,
-        primary_loc: SrcLoc,
-        primary_label: impl Into<String>,
-        secondary_loc: SrcLoc,
-        secondary_label: impl Into<String>,
-    ) -> Self {
-        if primary_loc.source == secondary_loc.source {
-            self.element(
-                Annotations::new(primary_loc.source)
-                    .primary(primary_loc.span, primary_label)
-                    .secondary(secondary_loc.span, secondary_label),
-            )
-        } else {
-            self.primary(primary_loc.source, primary_loc.span, primary_label).element(
-                Annotations::new(secondary_loc.source)
-                    .secondary(secondary_loc.span, secondary_label),
-            )
-        }
-    }
-
-    pub fn note(mut self, message: impl Into<String>) -> Self {
-        self.primary_elements
-            .push(Element::Message { level: Some(Level::Note), text: message.into() });
-        self
-    }
-
-    pub fn help(mut self, message: impl Into<String>) -> Self {
-        self.primary_elements
-            .push(Element::Message { level: Some(Level::Help), text: message.into() });
-        self
-    }
-
-    pub fn add_claim(mut self, claim: Claim) -> Self {
+    pub fn claim(mut self, claim: Claim) -> Self {
         self.added_claims.push(claim);
         self
     }
@@ -251,6 +257,10 @@ impl Diagnostic {
 
     pub fn render_styled(&self, session: &Session) -> String {
         self.render_with(session, Renderer::styled())
+    }
+
+    pub fn emit(self, session: &mut Session) {
+        session.emit_diagnostic(self);
     }
 
     fn render_with(&self, session: &Session, renderer: Renderer) -> String {
