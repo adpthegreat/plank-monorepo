@@ -225,6 +225,26 @@ fn test_if_three_branches() {
 }
 
 #[test]
+fn test_type_annotation_not_comptime() {
+    assert_diagnostics(
+        "
+        init {
+            let T = calldataload(0);
+            let x: T = 5;
+            evm_stop();
+        }
+        ",
+        &[r#"
+        error: type must be known at compile time
+         --> main.plk:3:12
+          |
+        3 |     let x: T = 5;
+          |            ^ not known at compile time
+        "#],
+    );
+}
+
+#[test]
 fn test_if_two_branches_type_mismatch() {
     assert_diagnostics(
         "
@@ -329,6 +349,28 @@ fn test_run_missing_termination() {
         4 | / run {
         5 | |     let x = 5;
         6 | | }
+          | |_^ execution may reach end of entry point
+          |
+          = help: entry points must end with a terminating `never` expression (e.g. `evm_stop()`, `revert(...)`, `invalid()`)
+        "#],
+    );
+}
+
+#[test]
+fn test_init_missing_termination() {
+    assert_diagnostics(
+        "
+        init {
+            sstore(0, 1);
+        }
+        ",
+        &[r#"
+        error: entry point must end with explicit terminator
+         --> main.plk:1:1
+          |
+        1 | / init {
+        2 | |     sstore(0, 1);
+        3 | | }
           | |_^ execution may reach end of entry point
           |
           = help: entry points must end with a terminating `never` expression (e.g. `evm_stop()`, `revert(...)`, `invalid()`)
@@ -1433,6 +1475,33 @@ fn test_comptime_call_arg_count_mismatch() {
 }
 
 #[test]
+fn test_cross_file_type_mismatch() {
+    assert_project_diagnostics(
+        TestProject::root(
+            "
+            import m::other::f;
+            const y = f(true);
+            init { evm_stop(); }
+            ",
+        )
+        .add_file("other", "const f = fn(x: u256) u256 { return x; };")
+        .add_module("m", ""),
+        &[r#"
+        error: mismatched types
+         --> main.plk:2:13
+          |
+        2 | const y = f(true);
+          |             ^^^^ expected `u256`, got `bool`
+          |
+         ::: other.plk:1:17
+          |
+        1 | const f = fn(x: u256) u256 { return x; };
+          |                 ---- `u256` expected because of this
+        "#],
+    );
+}
+
+#[test]
 fn test_cross_file_call_arg_count_mismatch() {
     assert_project_diagnostics(
         TestProject::root("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
@@ -2159,6 +2228,28 @@ fn test_const_mutual_cycle() {
           |
         1 | const A = B;
           | ^^^^^^^^^^^^ `A` depends on itself
+        "#],
+    );
+}
+
+#[test]
+fn test_const_with_type_error_does_not_panic() {
+    assert_diagnostics(
+        r#"
+        const x = {
+            let a: bool = 5;
+            a
+        };
+        init { evm_stop(); }
+        "#,
+        &[r#"
+        error: mismatched types
+         --> main.plk:2:19
+          |
+        2 |     let a: bool = 5;
+          |            ----   ^ expected `bool`, got `u256`
+          |            |
+          |            `bool` expected because of this
         "#],
     );
 }
