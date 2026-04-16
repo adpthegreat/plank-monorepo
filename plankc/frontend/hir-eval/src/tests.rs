@@ -16,7 +16,11 @@ fn try_lower(project: impl Into<TestProject>) -> (Mir, ValueInterner, Session) {
 }
 
 fn assert_lowers_to(source: &str, expected: &str) {
-    let (mir, big_nums, session) = try_lower(source);
+    assert_project_lowers_to(source, expected)
+}
+
+fn assert_project_lowers_to(project: impl Into<TestProject>, expected: &str) {
+    let (mir, big_nums, session) = try_lower(project);
 
     if session.has_errors() {
         let diags: Vec<String> =
@@ -30,7 +34,7 @@ fn assert_lowers_to(source: &str, expected: &str) {
     pretty_assertions::assert_str_eq!(actual.trim(), expected.trim());
 }
 
-fn render_project_diagnostics(test_project: TestProject) -> Vec<String> {
+fn render_project_diagnostics(test_project: impl Into<TestProject>) -> Vec<String> {
     let (_, _, session) = try_lower(test_project);
     session.diagnostics().iter().map(|d| d.render_plain(&session)).collect()
 }
@@ -41,7 +45,7 @@ fn assert_diagnostics(source: &str, expected: &[&str]) {
 }
 
 #[track_caller]
-fn assert_project_diagnostics(test_project: TestProject, expected: &[&str]) {
+fn assert_project_diagnostics(test_project: impl Into<TestProject>, expected: &[&str]) {
     let actual = render_project_diagnostics(test_project);
     let expected: Vec<String> =
         expected.iter().map(|s| dedent_preserve_blank_lines(s).trim().to_string()).collect();
@@ -87,12 +91,12 @@ fn test_simple_malloc_mstore_return() {
 #[test]
 fn test_type_annotation_type_mismatch() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let x: u256 = false;
             evm_stop();
         }
-        ",
+        "#,
         &[r#"
         error: mismatched types
          --> main.plk:2:19
@@ -108,7 +112,7 @@ fn test_type_annotation_type_mismatch() {
 #[test]
 fn test_no_else_if_as_expr() {
     assert_lowers_to(
-        "
+        r#"
         init {
             let cond = calldataload(0);
             let y = if iszero(cond) {
@@ -118,7 +122,7 @@ fn test_no_else_if_as_expr() {
             };
             evm_stop();
         }
-        ",
+        "#,
         r#"
         ==== Functions ====
         ; init
@@ -155,7 +159,7 @@ fn test_no_else_if_as_expr() {
 #[test]
 fn test_comptime_if_condition_folds_in_runtime() {
     assert_lowers_to(
-        "
+        r#"
         init {
             let cond = false;
             if cond {
@@ -165,7 +169,7 @@ fn test_comptime_if_condition_folds_in_runtime() {
             }
             evm_stop();
         }
-        ",
+        "#,
         r#"
         ==== Functions ====
         ; init
@@ -184,7 +188,7 @@ fn test_comptime_if_condition_folds_in_runtime() {
 #[test]
 fn test_if_three_branches() {
     assert_lowers_to(
-        "
+        r#"
         init {
             let c = calldataload(0);
             let x = if slt(c, 0)  {
@@ -196,7 +200,7 @@ fn test_if_three_branches() {
             };
             evm_stop();
         }
-        ",
+        "#,
         r#"
         ==== Functions ====
         ; init
@@ -247,7 +251,7 @@ fn test_type_annotation_not_comptime() {
 #[test]
 fn test_if_two_branches_type_mismatch() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let c = calldataload(0);
             let x = if slt(c, 0)  {
@@ -257,7 +261,7 @@ fn test_if_two_branches_type_mismatch() {
             };
             evm_stop();
         }
-        ",
+        "#,
         &[r#"
             error: `if` and `else` have incompatible types
              --> main.plk:6:9
@@ -274,7 +278,7 @@ fn test_if_two_branches_type_mismatch() {
 #[test]
 fn test_if_three_branches_type_mismatch() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let c = calldataload(0);
             let x = if slt(c, 0) {
@@ -286,7 +290,7 @@ fn test_if_three_branches_type_mismatch() {
             };
             evm_stop();
         }
-        ",
+        "#,
         &[r#"
             error: `if` and `else` have incompatible types
              --> main.plk:6:9
@@ -303,7 +307,7 @@ fn test_if_three_branches_type_mismatch() {
 #[test]
 fn test_if_type_mismatch() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let c = calldataload(0);
             let x: u256 = if slt(c, 0)  {
@@ -313,7 +317,7 @@ fn test_if_type_mismatch() {
             };
             evm_stop();
         }
-        ",
+        "#,
         &[r#"
             error: mismatched types
              --> main.plk:3:19
@@ -334,14 +338,14 @@ fn test_if_type_mismatch() {
 #[test]
 fn test_run_missing_termination() {
     assert_diagnostics(
-        "
+        r#"
         init {
             evm_stop();
         }
         run {
             let x = 5;
         }
-        ",
+        "#,
         &[r#"
         error: entry point must end with explicit terminator
          --> main.plk:4:1
@@ -381,14 +385,14 @@ fn test_init_missing_termination() {
 #[test]
 fn test_never_fn_missing_termination() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let halt = fn() never {
                 let x = 5;
             };
             halt();
         }
-        ",
+        "#,
         &[r#"
         error: mismatched types
          --> main.plk:2:27
@@ -407,7 +411,7 @@ fn test_never_fn_missing_termination() {
 #[test]
 fn test_init_run_with_never_fn() {
     assert_lowers_to(
-        "
+        r#"
         init {
             let halt = fn() never {
                 evm_stop();
@@ -423,7 +427,7 @@ fn test_init_run_with_never_fn() {
             };
             abort();
         }
-        ",
+        "#,
         "
         ==== Functions ====
         @fn0() -> never {
@@ -1159,11 +1163,11 @@ fn test_runtime_call_arg_type_mismatch() {
 #[test]
 fn test_runtime_if_condition_comptime_not_bool() {
     assert_diagnostics(
-        "
+        r#"
         init {
             if 42 { evm_stop(); } else { evm_stop(); }
         }
-        ",
+        "#,
         &[r#"
         error: mismatched types
          --> main.plk:2:8
@@ -1177,12 +1181,12 @@ fn test_runtime_if_condition_comptime_not_bool() {
 #[test]
 fn test_runtime_if_condition_runtime_not_bool() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let c = calldataload(0);
             if c { evm_stop(); } else { evm_stop(); }
         }
-        ",
+        "#,
         &[r#"
         error: mismatched types
          --> main.plk:3:8
@@ -1196,13 +1200,13 @@ fn test_runtime_if_condition_runtime_not_bool() {
 #[test]
 fn test_runtime_while_condition_not_bool() {
     assert_diagnostics(
-        "
+        r#"
         init {
             let c = calldataload(0);
             while c { }
             evm_stop();
         }
-        ",
+        "#,
         &[r#"
         error: mismatched types
          --> main.plk:3:11
@@ -1504,21 +1508,80 @@ fn test_cross_file_type_mismatch() {
 #[test]
 fn test_cross_file_call_arg_count_mismatch() {
     assert_project_diagnostics(
-        TestProject::root("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
-            .add_file("other", "const f = fn(x: u256) u256 { return x; };")
-            .add_module("m", ""),
+        TestProject::root(
+            r#"
+            import m::other::f;
+            init {
+                f(1, 2);
+                evm_stop();
+            }
+        "#,
+        )
+        .add_file(
+            "other",
+            r#"
+                const f = fn(x: u256) u256 { return x; };
+            "#,
+        )
+        .add_module("m", ""),
         &[r#"
         error: wrong number of arguments
-         --> main.plk:2:8
+         --> main.plk:3:5
           |
-        2 | init { f(1, 2); evm_stop(); }
-          |        ^^^^^^^ expected 1 argument, got 2
+        3 |     f(1, 2);
+          |     ^^^^^^^ expected 1 argument, got 2
           |
          ::: other.plk:1:13
           |
         1 | const f = fn(x: u256) u256 { return x; };
           |             --------- defined with 1 parameter
         "#],
+    );
+}
+
+#[test]
+fn test_import_group_symbols_accessible() {
+    assert_project_lowers_to(
+        TestProject::root(
+            r#"
+            import m::other::{f, g as my_g};
+            init {
+                let x = f(1);
+                let y = my_g(2, 3);
+                evm_stop();
+            }
+        "#,
+        )
+        .add_file(
+            "other",
+            r#"
+            const f = fn(x: u256) u256 { return x; };
+            const g = fn(a: u256, b: u256) u256 { return a; };
+            "#,
+        )
+        .add_module("m", ""),
+        r#"
+        ==== Functions ====
+        @fn0(%0: u256) -> u256 {
+            %1 : u256 = %0
+            ret %1
+        }
+
+        @fn1(%0: u256, %1: u256) -> u256 {
+            %2 : u256 = %0
+            ret %2
+        }
+
+        ; init
+        @fn2() -> never {
+            %0 : u256 = 1
+            %1 : u256 = call @fn0(%0)
+            %2 : u256 = 2
+            %3 : u256 = 3
+            %4 : u256 = call @fn1(%2, %3)
+            %5 : never = evm_stop()
+        }
+        "#,
     );
 }
 
