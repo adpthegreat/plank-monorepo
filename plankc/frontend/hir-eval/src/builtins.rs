@@ -98,16 +98,15 @@ impl Scope<'_, '_> {
         if builtin.is_pure() {
             let folded = self.with_values_buf(|this, values_buf_offset| {
                 for &arg in args {
-                    let (state, arg_def_span) = this.bindings[arg]
+                    let (state, _arg_use_span, arg_origin) = this.bindings[arg]
                         .poisoned()
                         .expect("invariant: arg type check checks poison");
                     match state {
                         LocalState::Comptime(vid) => this.values_buf.push(vid),
                         LocalState::Runtime(_) if this.is_comptime() => {
                             this.diag_ctx.emit_runtime_ref_in_comptime(
-                                this.source,
-                                expr_span,
-                                arg_def_span,
+                                this.loc(expr_span),
+                                this.origin_loc(arg_origin),
                             );
                             return Err(Poisoned);
                         }
