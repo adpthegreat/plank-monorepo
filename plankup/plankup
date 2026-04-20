@@ -193,6 +193,13 @@ main() {
         say "documentation installed to $PLANK_DOC_DIR"
     fi
 
+    # Install standard library
+    if [ -d "$tmpdir/std" ]; then
+        rm -rf "$PLANK_DIR/stdlib"
+        mv "$tmpdir/std" "$PLANK_DIR/stdlib"
+        say "standard library installed to $PLANK_DIR/stdlib"
+    fi
+
     # VS Code extension install/update
     install_vscode_extension "$version" "$tmpdir"
 

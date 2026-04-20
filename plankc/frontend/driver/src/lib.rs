@@ -67,6 +67,7 @@ impl<'a, F: SourceFs> Driver<'a, F> {
 mod tests {
     use super::*;
     use plank_source::source_fs::InMemoryFs;
+    use plank_test_utils::{assert_diagnostics, dedent_preserve_indent};
 
     #[test]
     fn duplicate_dep_emits_diagnostic() {
@@ -77,13 +78,14 @@ mod tests {
         driver.register_module("m", PathBuf::from("/a"));
         driver.register_module("m", PathBuf::from("/b"));
 
-        let rendered = driver.session.diagnostics()[0].render_plain(&driver.session);
-        pretty_assertions::assert_str_eq!(
-            rendered.trim(),
-            "\
-error: duplicate module 'm'
-  |
-  = help: each module name can only be registered once"
+        assert_diagnostics(
+            driver.session.diagnostics(),
+            &driver.session,
+            &[r#"
+            error: duplicate module 'm'
+              |
+              = help: each module name can only be registered once
+            "#],
         );
     }
 
@@ -92,15 +94,16 @@ error: duplicate module 'm'
         let fs = InMemoryFs::new();
         let mut driver = Driver::new(&fs);
         let result = driver.load_project(Path::new("nonexistent.plk"));
-
         assert!(result.is_none());
-        let rendered = driver.session.diagnostics()[0].render_plain(&driver.session);
-        pretty_assertions::assert_str_eq!(
-            rendered.trim(),
-            "\
-error: could not open entry file
-  |
-  = note: 'nonexistent.plk': file not found in InMemoryFs: nonexistent.plk"
+
+        assert_diagnostics(
+            driver.session.diagnostics(),
+            &driver.session,
+            &[r#"
+            error: could not open entry file
+              |
+              = note: 'nonexistent.plk': file not found in InMemoryFs: nonexistent.plk
+            "#],
         );
     }
 
@@ -112,15 +115,49 @@ error: could not open entry file
         let mut driver = Driver::new(&fs);
         driver.load_project(Path::new("main.plk"));
 
-        let rendered = driver.session.diagnostics()[0].render_plain(&driver.session);
-        pretty_assertions::assert_str_eq!(
-            rendered.trim(),
-            "\
-error: unresolved import
- --> main.plk:1:8
-  |
-1 | import foo::bar::Baz;
-  |        ^^^ unknown module 'foo'"
+        assert_diagnostics(
+            driver.session.diagnostics(),
+            &driver.session,
+            &[r#"
+            error: unresolved import
+             --> main.plk:1:8
+              |
+            1 | import foo::bar::Baz;
+              |        ^^^ unknown module 'foo'
+            "#],
+        );
+    }
+
+    #[test]
+    fn test_unknown_std_module_import_emits_diagnostic_with_help() {
+        let mut fs = InMemoryFs::new();
+        fs.add_file(
+            "main.plk",
+            dedent_preserve_indent(
+                r#"
+                import std::math::max;
+                init {}
+                "#,
+            )
+            .to_string(),
+        );
+
+        let mut driver = Driver::new(&fs);
+        driver.load_project(Path::new("main.plk"));
+
+        assert_diagnostics(
+            driver.session.diagnostics(),
+            &driver.session,
+            &[r#"
+            error: unresolved import
+             --> main.plk:1:8
+              |
+            1 | import std::math::max;
+              |        ^^^ unknown module 'std'
+              |
+              = help: the 'std' module is included with plankup, the Plank installer
+              = note: see https://github.com/plankevm/plank-monorepo for installation instructions
+            "#],
         );
     }
 
@@ -133,17 +170,18 @@ error: unresolved import
         driver.register_module("m", PathBuf::from("/lib"));
         driver.load_project(Path::new("main.plk"));
 
-        let rendered = driver.session.diagnostics()[0].render_plain(&driver.session);
-        pretty_assertions::assert_str_eq!(
-            rendered.trim(),
-            "\
-error: could not open imported file
- --> main.plk:1:8
-  |
-1 | import m::a::b::X;
-  |        ^^^^^^^ imported here
-  |
-  = note: '/lib/a/b.plk': file not found in InMemoryFs: /lib/a/b.plk"
+        assert_diagnostics(
+            driver.session.diagnostics(),
+            &driver.session,
+            &[r#"
+            error: could not open imported file
+             --> main.plk:1:8
+              |
+            1 | import m::a::b::X;
+              |        ^^^^^^^ imported here
+              |
+              = note: '/lib/a/b.plk': file not found in InMemoryFs: /lib/a/b.plk
+            "#],
         );
     }
 }
