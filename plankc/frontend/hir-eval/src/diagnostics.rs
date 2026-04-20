@@ -1,10 +1,8 @@
+use alloy_primitives::U256;
 use plank_core::{Span, must_use::MustUseStrict};
 use plank_hir as hir;
-use plank_session::{builtins::builtin_names, diagnostic::fmt_count, *};
-use plank_values::{
-    TypeId, TypeInterner,
-    builtins::{arg_count, builtin_signatures},
-};
+use plank_session::{Builtin, builtins::builtin_names, diagnostic::fmt_count, *};
+use plank_values::{TypeId, TypeInterner, builtins as builtin_sigs};
 
 pub(crate) struct BindingLoc {
     pub r#use: SrcLoc,
@@ -82,8 +80,6 @@ impl DiagCtx<'_> {
         );
         let secondary_label =
             format!("`{}` expected because of this", self.types.format(self.session, expected_ty));
-        // Bypass augmented emission: type mismatches from eval_param already
-        // annotate the call-site argument, so "instantiated here" would be redundant.
         let diagnostic = Diagnostic::error("mismatched types").cross_source_annotations(
             actual_loc,
             primary_label,
@@ -328,16 +324,33 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
-    pub fn emit_no_matching_builtin_signature(
+    pub fn emit_set_field_on_comptime_only_struct(
         &mut self,
-        builtin: EvmBuiltin,
-        arg_types: &[TypeId],
-        loc: SrcLoc,
+        struct_ty: TypeId,
+        value_loc: SrcLoc,
+        struct_def_loc: SrcLoc,
     ) {
+        let struct_name = self.types.format(self.session, struct_ty);
+        Diagnostic::error("mixing comptime and runtime data in struct")
+            .cross_source_annotations(
+                value_loc,
+                "this value is only known at runtime",
+                struct_def_loc,
+                format!("`{struct_name}` is comptime-only"),
+            )
+            .emit(self);
+    }
+
+    fn format_signatures_note(&self, builtin: Builtin) -> Option<String> {
         use std::fmt::Write;
 
-        let mut note = format!("`{builtin}` accepts ");
-        for (i, &sig) in builtin_signatures(builtin).iter().enumerate() {
+        let signatures = builtin_sigs::builtin_signatures(builtin);
+        if signatures.is_empty() {
+            return None;
+        }
+
+        let mut note = format!("`{}` accepts ", builtin.name());
+        for (i, sig) in signatures.iter().enumerate() {
             if i > 0 {
                 note.push_str(", ");
             }
@@ -346,39 +359,72 @@ impl DiagCtx<'_> {
                 if j > 0 {
                     note.push_str(", ");
                 }
-                write!(note, "{}", self.types.format(self.session, ty)).unwrap();
+                let _ = write!(note, "{}", self.types.format(self.session, ty));
             }
             note.push(')');
         }
-
-        let (title, label) = if arg_count(builtin) == arg_types.len() {
-            let mut args_str = String::new();
-            for (i, &ty) in arg_types.iter().enumerate() {
-                if i > 0 {
-                    args_str.push_str(", ");
-                }
-                write!(args_str, "{}", self.types.format(self.session, ty)).unwrap();
-            }
-            (
-                "no valid match for builtin signature",
-                format!("`{builtin}` cannot be called with ({args_str})"),
-            )
-        } else {
-            let expected = arg_count(builtin);
-            (
-                "wrong number of arguments",
-                format!(
-                    "`{builtin}` called with {}, but requires {}",
-                    fmt_count(arg_types.len(), "argument"),
-                    expected,
-                ),
-            )
-        };
-
-        Diagnostic::error(title).primary(loc.source, loc.span, label).note(note).emit(self);
+        Some(note)
     }
 
-    pub fn emit_unsupported_eval_of_evm_builtin(&mut self, builtin: EvmBuiltin, loc: SrcLoc) {
+    pub fn emit_wrong_arg_count(&mut self, builtin: Builtin, actual: usize, loc: SrcLoc) {
+        let name = builtin.name();
+        let expected = builtin_sigs::arg_count(builtin);
+
+        let mut diag = Diagnostic::error("wrong number of arguments").primary(
+            loc.source,
+            loc.span,
+            format!(
+                "`{name}` called with {}, but requires {expected}",
+                fmt_count(actual, "argument"),
+            ),
+        );
+
+        if let Some(note) = self.format_signatures_note(builtin) {
+            diag = diag.note(note);
+        }
+
+        diag.emit(self);
+    }
+
+    pub fn emit_no_matching_builtin_signature(
+        &mut self,
+        builtin: Builtin,
+        arg_types: &[TypeId],
+        loc: SrcLoc,
+    ) {
+        use std::fmt::Write;
+
+        if builtin_sigs::arg_count(builtin) != arg_types.len() {
+            return self.emit_wrong_arg_count(builtin, arg_types.len(), loc);
+        }
+
+        let name = builtin.name();
+        let mut args_str = String::new();
+        for (i, &ty) in arg_types.iter().enumerate() {
+            if i > 0 {
+                args_str.push_str(", ");
+            }
+            let _ = write!(args_str, "{}", self.types.format(self.session, ty));
+        }
+
+        let mut diag = Diagnostic::error("no valid match for builtin signature").primary(
+            loc.source,
+            loc.span,
+            format!("`{name}` cannot be called with ({args_str})"),
+        );
+
+        if let Some(note) = self.format_signatures_note(builtin) {
+            diag = diag.note(note);
+        }
+
+        diag.emit(self);
+    }
+
+    pub fn emit_unsupported_eval_of_runtime_builtin(
+        &mut self,
+        builtin: RuntimeBuiltin,
+        loc: SrcLoc,
+    ) {
         Diagnostic::error("builtin not supported at compile time")
             .primary(
                 loc.source,
@@ -476,6 +522,66 @@ impl DiagCtx<'_> {
                     self.session.lookup_name(field_name),
                     self.types.format(self.session, struct_ty),
                 ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_expected_struct_type_arg(
+        &mut self,
+        builtin: Builtin,
+        actual_ty: TypeId,
+        loc: SrcLoc,
+    ) {
+        Diagnostic::error("expected struct type")
+            .primary(
+                loc.source,
+                loc.span,
+                format!(
+                    "`{builtin}` expects a struct type, got `{}`",
+                    self.types.format(self.session, actual_ty),
+                ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_expected_type_arg(&mut self, builtin: Builtin, actual_ty: TypeId, loc: SrcLoc) {
+        Diagnostic::error("expected type argument")
+            .primary(
+                loc.source,
+                loc.span,
+                format!(
+                    "`{builtin}` expects a type argument, got a value of type `{}`",
+                    self.types.format(self.session, actual_ty),
+                ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_field_index_out_of_bounds(
+        &mut self,
+        builtin: Builtin,
+        index: U256,
+        field_count: usize,
+        loc: SrcLoc,
+    ) {
+        Diagnostic::error("field index out of bounds")
+            .primary(
+                loc.source,
+                loc.span,
+                format!(
+                    "`{builtin}`: field index {index} is out of bounds for struct with {}",
+                    fmt_count(field_count, "field"),
+                ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_expected_comptime_arg(&mut self, builtin: Builtin, arg_name: &str, loc: SrcLoc) {
+        Diagnostic::error("expected comptime argument")
+            .primary(
+                loc.source,
+                loc.span,
+                format!("`{builtin}` requires {arg_name} to be known at comptime"),
             )
             .emit(self);
     }

@@ -15,7 +15,7 @@ fn test_struct_field_access() {
             let mut pa = p.a;
             let mut pb = p.b;
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -32,7 +32,7 @@ fn test_struct_field_access() {
             %4 : u256 = %3.0
             %5 : Pair = %2
             %6 : bool = %5.1
-            %7 : never = evm_stop()
+            %7 : never = @evm_stop()
         }
         "#,
     );
@@ -47,7 +47,7 @@ fn test_invalid_field_access() {
         init {
             let x = Pair { b: false, a : 34 };
             let y: u256 = x.hey;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -69,7 +69,7 @@ fn test_comptime_invalid_field_access() {
         const x = p.hey;
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -94,7 +94,7 @@ fn test_comptime_struct_field_ordering() {
         init {
             let mut x: u256 = a_val;
             let mut y: bool = b_val;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -103,7 +103,7 @@ fn test_comptime_struct_field_ordering() {
         @fn0() -> never {
             %0 : u256 = 42
             %1 : bool = true
-            %2 : never = evm_stop()
+            %2 : never = @evm_stop()
         }
         "#,
     );
@@ -117,7 +117,7 @@ fn test_comptime_struct_missing_field() {
         const my_pair = Pair { a: 42 };
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -138,7 +138,7 @@ fn test_comptime_struct_unknown_field() {
         const my_pair = Pair { a: 42, c: true, b: false };
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -159,7 +159,7 @@ fn test_comptime_struct_duplicate_field() {
         const my_pair = Pair { a: 42, a: 99, b: false };
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -182,7 +182,7 @@ fn test_comptime_struct_unknown_and_missing() {
         const my_pair = Pair { a: 42, c: true };
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[
@@ -212,7 +212,7 @@ fn test_comptime_struct_field_type_mismatch() {
         const my_pair = Pair { a: false, b: false };
 
         init {
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -231,11 +231,11 @@ fn test_mixed_comptime_runtime_struct() {
         r#"
         const Wrapper = struct { t: type, n: u256 };
         init {
-            let x = calldataload(0);
+            let x = @evm_calldataload(0);
             let w = Wrapper { t: u256, n: x,
                 c: 34
             };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[
@@ -268,7 +268,7 @@ fn test_comptime_struct_def_field_not_type() {
     assert_diagnostics(
         r#"
         const S = struct { x: 42 };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: value used as type
@@ -286,7 +286,7 @@ fn test_comptime_struct_lit_type_not_type() {
         r#"
         const T = 42;
         const x = T { };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: value used as type
@@ -307,7 +307,7 @@ fn test_struct_lit_value_as_type_in_init() {
         const T = 42;
         init {
             let x = T { };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -328,9 +328,9 @@ fn test_struct_type_not_comptime_known() {
     assert_diagnostics(
         r#"
         init {
-            let T = calldataload(0);
+            let T = @evm_calldataload(0);
             let x = T { };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -349,7 +349,7 @@ fn test_runtime_struct_def_field_not_type() {
         r#"
         init {
             let S = struct { x: 42 };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -367,9 +367,9 @@ fn test_runtime_struct_def_type_index_not_comptime() {
     assert_diagnostics(
         r#"
         init {
-            let T = calldataload(0);
+            let T = @evm_calldataload(0);
             let S = struct T { x: u256 };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -387,9 +387,9 @@ fn test_runtime_struct_def_field_type_not_comptime() {
     assert_diagnostics(
         r#"
         init {
-            let T = calldataload(0);
+            let T = @evm_calldataload(0);
             let S = struct { x: T };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -409,7 +409,7 @@ fn test_runtime_struct_lit_field_type_mismatch() {
         const Pair = struct { a: u256, b: bool };
         init {
             let x = Pair { a: false, b: false };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -427,7 +427,7 @@ fn test_comptime_struct_lit_not_a_struct() {
     assert_diagnostics(
         r#"
         const x = u256 { };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: expected struct type
@@ -445,7 +445,7 @@ fn test_runtime_struct_lit_not_a_struct() {
         r#"
         init {
             let x = u256 { };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -466,7 +466,7 @@ fn test_cross_file_struct_lit_not_a_struct() {
             import m::other::T;
             init {
                 let x = T { value: 1 };
-                evm_stop();
+                @evm_stop();
             }
             ",
         )
@@ -495,7 +495,7 @@ fn test_cross_file_type_not_type() {
             import m::other::T;
             init {
                 let x = T { };
-                evm_stop();
+                @evm_stop();
             }
             ",
         )
@@ -523,7 +523,7 @@ fn test_runtime_struct_lit_unknown_field() {
         const Pair = struct { a: u256, b: bool };
         init {
             let x = Pair { a: 42, c: true, b: false };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -543,7 +543,7 @@ fn test_runtime_struct_lit_duplicate_field() {
         const Pair = struct { a: u256, b: bool };
         init {
             let x = Pair { a: 42, a: 99, b: false };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -565,7 +565,7 @@ fn test_runtime_struct_lit_missing_field() {
         const Pair = struct { a: u256, b: bool };
         init {
             let x = Pair { a: 42 };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -584,7 +584,7 @@ fn test_comptime_member_on_non_struct() {
         r#"
         const x: u256 = 5;
         const y = x.foo;
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: no fields on type
@@ -603,9 +603,9 @@ fn test_runtime_member_on_non_struct() {
     assert_diagnostics(
         r#"
         init {
-            let x: u256 = calldataload(0);
+            let x: u256 = @evm_calldataload(0);
             let y = x.foo;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -625,7 +625,7 @@ fn test_cross_file_member_on_non_struct() {
             "
             import m::other::x;
             const y = x.foo;
-            init { evm_stop(); }
+            init { @evm_stop(); }
             ",
         )
         .add_file("other", "const x: u256 = 5;")
@@ -650,7 +650,7 @@ fn test_struct_def_duplicate_field() {
     assert_diagnostics(
         r#"
         const S = struct { x: u256, x: bool };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: duplicate field name in struct definition
@@ -677,7 +677,7 @@ fn test_type_index_expr_eagerly_evaluates() {
             };
             let mut t = T { wow: 67 };
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -687,7 +687,7 @@ fn test_type_index_expr_eagerly_evaluates() {
             %0 : struct#0@main.plk:4:13 = struct#0 {
                 67,
             }
-            %1 : never = evm_stop()
+            %1 : never = @evm_stop()
         }
         "#,
     );

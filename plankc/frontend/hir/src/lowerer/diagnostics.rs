@@ -1,7 +1,7 @@
 use plank_parser::lexer::{Token, TokenSpan};
 use plank_session::{
-    Annotations, Claim, ClaimBuilder, Diagnostic, Element, Level, Session, SourceId, SourceSpan,
-    StrId,
+    Annotations, Builtin, Claim, ClaimBuilder, Diagnostic, Element, Level, Session, SourceId,
+    SourceSpan, StrId,
 };
 
 use super::BlockLowerer;
@@ -21,9 +21,13 @@ impl BlockLowerer<'_> {
     pub(crate) fn error_unresolved_identifier(&self, name: StrId, span: TokenSpan) {
         let source_span = self.lexed.tokens_src_span(span);
         let name_str = self.lookup_name(name);
-        Diagnostic::error(format!("unresolved identifier '{name_str}'"))
-            .primary(self.source_id, source_span, "not found in this scope")
-            .emit(*self.session.borrow_mut());
+        let at_name = self.session.borrow_mut().intern(&format!("@{name_str}"));
+        let mut diagnostic = Diagnostic::error(format!("unresolved identifier '{name_str}'"))
+            .primary(self.source_id, source_span, "not found in this scope");
+        if let Some(builtin) = Builtin::from_str_id(at_name) {
+            diagnostic = diagnostic.help(format!("if you meant the builtin, use `{builtin}`"));
+        }
+        diagnostic.emit(*self.session.borrow_mut());
     }
 
     pub(crate) fn error_assignment_to_immutable(
@@ -89,18 +93,18 @@ impl BlockLowerer<'_> {
     }
 
     pub(crate) fn error_shadowing_primitive_type(&self, name: StrId, span: TokenSpan) {
-        self.error_shadowing("primitive type", name, span);
-    }
-
-    pub(crate) fn error_shadowing_builtin(&self, name: StrId, span: TokenSpan) {
-        self.error_shadowing("built-in function", name, span);
-    }
-
-    fn error_shadowing(&self, kind: &str, name: StrId, span: TokenSpan) {
         let source_span = self.lexed.tokens_src_span(span);
         let name_str = self.lookup_name(name);
-        Diagnostic::error(format!("shadowing {kind}"))
-            .primary(self.source_id, source_span, format!("'{name_str}' is a {kind}"))
+        Diagnostic::error("shadowing primitive type")
+            .primary(self.source_id, source_span, format!("'{name_str}' is a primitive type"))
+            .emit(*self.session.borrow_mut());
+    }
+
+    pub(crate) fn error_unknown_builtin(&self, name: StrId, span: TokenSpan) {
+        let source_span = self.lexed.tokens_src_span(span);
+        let name_str = self.lookup_name(name);
+        Diagnostic::error(format!("unknown builtin '{name_str}'"))
+            .primary(self.source_id, source_span, "no built-in function with this name")
             .emit(*self.session.borrow_mut());
     }
 

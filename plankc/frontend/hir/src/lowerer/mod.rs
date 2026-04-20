@@ -7,7 +7,7 @@ use plank_parser::{
     cst::{self, NumLitId},
     lexer::{Lexed, TokenSpan},
 };
-use plank_session::{EvmBuiltin, Poisoned, Session, SourceId, SourceSpan, StrId};
+use plank_session::{Builtin, Poisoned, Session, SourceId, SourceSpan, StrId};
 use plank_source::project::{FileImport, ImportKind};
 use plank_values::{TypeId, ValueInterner};
 
@@ -181,8 +181,6 @@ impl BlockLowerer<'_> {
     fn alloc_local(&mut self, name: StrId, mutable: bool, span: TokenSpan) -> LocalId {
         if TypeId::resolve_primitive(name).is_some() {
             self.error_shadowing_primitive_type(name, span);
-        } else if EvmBuiltin::from_str_id(name).is_some() {
-            self.error_shadowing_builtin(name, span);
         }
 
         let id = self.next_local_id.get_and_inc();
@@ -202,6 +200,15 @@ impl BlockLowerer<'_> {
 
     fn expr(&self, kind: ExprKind, span: TokenSpan) -> Expr {
         Expr { kind, span: self.lexed.tokens_src_span(span) }
+    }
+
+    fn lower_call_args<'a>(&mut self, args: impl Iterator<Item = ast::Expr<'a>>) -> CallArgsId {
+        let buf_start = self.locals_buf.len();
+        for arg in args {
+            let local = self.lower_expr_to_local(arg);
+            self.locals_buf.push(local);
+        }
+        self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..))
     }
 
     fn lower_expr_to_local(&mut self, expr: ast::Expr<'_>) -> LocalId {
@@ -312,11 +319,6 @@ impl BlockLowerer<'_> {
             return ExprKind::Value(Ok(self.values.intern_type(ty)));
         }
 
-        if EvmBuiltin::from_str_id(name).is_some() {
-            self.error_non_call_reference_to_builtin(name, span);
-            return ExprKind::POISON;
-        }
-
         if let Some(entry) = self.find_local(name) {
             return ExprKind::LocalRef(entry.id);
         }
@@ -338,6 +340,14 @@ impl BlockLowerer<'_> {
             ast::Expr::Block(block) => return self.lower_scope(block),
             ast::Expr::Error { .. } => ExprKind::Value(Err(Poisoned)),
             ast::Expr::Ident { name, span } => self.resolve_name(name, span),
+            ast::Expr::BuiltinName { name, span } => {
+                if Builtin::from_str_id(name).is_some() {
+                    self.error_non_call_reference_to_builtin(name, span);
+                } else {
+                    self.error_unknown_builtin(name, span);
+                }
+                ExprKind::POISON
+            }
             ast::Expr::BoolLiteral { value, .. } => ExprKind::Value(Ok(value.into())),
             ast::Expr::NumLiteral { id, span } => {
                 let limbs = &self.num_lit_limbs[id];
@@ -355,24 +365,17 @@ impl BlockLowerer<'_> {
             }
             ast::Expr::Call(call_expr) => {
                 let callee = call_expr.callee();
-                if let ast::Expr::Ident { name, span: _ } = callee
-                    && let Some(builtin) = EvmBuiltin::from_str_id(name)
-                {
-                    let buf_start = self.locals_buf.len();
-                    for arg in call_expr.args() {
-                        let local = self.lower_expr_to_local(arg);
-                        self.locals_buf.push(local);
+                if let ast::Expr::BuiltinName { name, span } = callee {
+                    let args = self.lower_call_args(call_expr.args());
+                    if let Some(builtin) = Builtin::from_str_id(name) {
+                        ExprKind::BuiltinCall { builtin, args }
+                    } else {
+                        self.error_unknown_builtin(name, span);
+                        ExprKind::POISON
                     }
-                    let args = self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..));
-                    ExprKind::EvmBuiltinCall { builtin, args }
                 } else {
                     let callee = self.lower_expr_to_local(callee);
-                    let buf_start = self.locals_buf.len();
-                    for arg in call_expr.args() {
-                        let local = self.lower_expr_to_local(arg);
-                        self.locals_buf.push(local);
-                    }
-                    let args = self.builder.call_args.push_iter(self.locals_buf.drain(buf_start..));
+                    let args = self.lower_call_args(call_expr.args());
                     ExprKind::Call { callee, args }
                 }
             }
@@ -382,7 +385,7 @@ impl BlockLowerer<'_> {
                 for result in struct_lit.fields() {
                     let Ok(field) = result else { continue };
                     let value = self.lower_expr_to_local(field.value());
-                    let name_offset = self.lexed.tokens_src_span(field.name_span()).start;
+                    let name_offset = self.lexed.token_src_span(field.name_span().start).start;
                     self.field_buf.push(FieldInfo { name: field.name, name_offset, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));
@@ -414,7 +417,7 @@ impl BlockLowerer<'_> {
                 for result in struct_def.fields() {
                     let Ok(field) = result else { continue };
                     let value = self.lower_expr_to_local(field.type_expr());
-                    let name_offset = self.lexed.tokens_src_span(field.name_span()).start;
+                    let name_offset = self.lexed.token_src_span(field.name_span().start).start;
                     self.field_buf.push(FieldInfo { name: field.name, name_offset, value });
                 }
                 let fields = self.builder.fields.push_iter(self.field_buf.drain(buf_start..));

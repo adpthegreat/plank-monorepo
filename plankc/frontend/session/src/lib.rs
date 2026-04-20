@@ -2,7 +2,7 @@ pub mod builtins;
 pub mod diagnostic;
 pub mod poison;
 
-pub use builtins::EvmBuiltin;
+pub use builtins::{Builtin, RuntimeBuiltin};
 pub use diagnostic::*;
 pub use poison::{MaybePoisoned, Poisoned};
 

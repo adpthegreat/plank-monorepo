@@ -19,6 +19,7 @@ pub enum Expr<'cst> {
     BoolLiteral { value: bool, span: TokenSpan },
     NumLiteral { id: NumLitId, span: TokenSpan },
     Ident { name: StrId, span: TokenSpan },
+    BuiltinName { name: StrId, span: TokenSpan },
     Error { span: TokenSpan },
 }
 
@@ -71,6 +72,7 @@ impl<'cst> Expr<'cst> {
                 NodeKind::BoolLiteral(value) => Expr::BoolLiteral { value, span },
                 NodeKind::NumLiteral { id } => Expr::NumLiteral { id, span },
                 NodeKind::Identifier { ident } => Expr::Ident { name: ident, span },
+                NodeKind::BuiltinName { ident } => Expr::BuiltinName { name: ident, span },
                 NodeKind::Error => Expr::Error { span },
                 _ => return None,
             };
@@ -95,6 +97,7 @@ impl<'cst> Expr<'cst> {
             Expr::BoolLiteral { span, .. }
             | Expr::NumLiteral { span, .. }
             | Expr::Ident { span, .. }
+            | Expr::BuiltinName { span, .. }
             | Expr::Error { span, .. } => *span,
         }
     }

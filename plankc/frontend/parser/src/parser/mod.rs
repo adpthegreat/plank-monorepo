@@ -376,9 +376,10 @@ impl<'a> Parser<'a> {
 
     fn intern(&mut self, ti: TokenIdx) -> StrId {
         let span = self.tokens.token_src_span(ti);
-        debug_assert!(
-            matches!(self.tokens.get_prev(), Some((Token::Identifier, p_span)) if p_span == span)
-        );
+        debug_assert!(matches!(
+            self.tokens.get_prev(),
+            Some((Token::Identifier | Token::BuiltinName, p_span)) if p_span == span
+        ));
         let source = &self.source[span.usize_range()];
         self.session.intern(source)
     }
@@ -391,12 +392,33 @@ impl<'a> Parser<'a> {
         None
     }
 
+    fn try_parse_builtin_name(&mut self) -> Option<NodeIdx> {
+        if self.eat(Token::BuiltinName) {
+            let ident = self.intern(self.tokens.current() - 1);
+            return Some(self.alloc_last_token_as_node(NodeKind::BuiltinName { ident }));
+        }
+        None
+    }
+
     fn expect_ident(&mut self) -> NodeIdx {
-        self.try_parse_ident().unwrap_or_else(|| {
-            self.emit_unexpected();
-            let error = self.alloc_node(NodeKind::Error);
-            self.close_node(error)
-        })
+        if let Some(ident) = self.try_parse_ident() {
+            return ident;
+        }
+        // Specially handle builtin names so we can give a more specific error when a user tries to
+        // use an `@identifier` as a normal identifier
+        if self.check(Token::BuiltinName) {
+            if !self.at_last_unexpected() {
+                let (_, span) = self.tokens.peek();
+                self.emit_builtin_name_used_as_ident(span);
+                self.last_unexpected = Some(self.tokens.current());
+                self.expected.clear();
+            }
+            self.advance();
+            return self.alloc_last_token_as_node(NodeKind::Error);
+        }
+        self.emit_unexpected();
+        let error = self.alloc_node(NodeKind::Error);
+        self.close_node(error)
     }
 
     // ========================== EXPRESSION PARSING ==========================
@@ -467,6 +489,10 @@ impl<'a> Parser<'a> {
 
         if let Some(identifier) = self.try_parse_ident() {
             return Some(identifier);
+        }
+
+        if let Some(builtin_name) = self.try_parse_builtin_name() {
+            return Some(builtin_name);
         }
 
         if self.eat(Token::LeftRound) {

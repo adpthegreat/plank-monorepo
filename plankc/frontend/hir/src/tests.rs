@@ -58,11 +58,11 @@ fn test_basic_init_builtin_calls() {
     assert_lowers_to(
         r#"
         init {
-            let a = calldataload(0x00);
-            let b: u256 = calldataload(0x20);
-            let buf = malloc_uninit(0x20);
-            mstore32(buf, add(a, b));
-            evm_return(buf, 0x20);
+            let a = @evm_calldataload(0x00);
+            let b: u256 = @evm_calldataload(0x20);
+            let buf = @malloc_uninit(0x20);
+            @mstore32(buf, @evm_add(a, b));
+            @evm_return(buf, 0x20);
         }
         "#,
         r#"
@@ -70,20 +70,20 @@ fn test_basic_init_builtin_calls() {
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
+        %1 = @evm_calldataload(%0)
         %2 = 32
         %4 = type:u256
-        %3 : %4 = calldataload(%2)
+        %3 : %4 = @evm_calldataload(%2)
         %5 = 32
-        %6 = malloc_uninit(%5)
+        %6 = @malloc_uninit(%5)
         %7 = %6
         %8 = %1
         %9 = %3
-        %10 = add(%8, %9)
-        eval mstore32(%7, %10)
+        %10 = @evm_add(%8, %9)
+        eval @mstore32(%7, %10)
         %11 = %6
         %12 = 32
-        eval evm_return(%11, %12)
+        eval @evm_return(%11, %12)
         "#,
     );
 }
@@ -94,13 +94,13 @@ fn test_inline_closure_lowering() {
         r#"
         init {
             let halt = fn() never {
-                evm_stop();
+                @evm_stop();
             };
             halt();
         }
         run {
             let halt = fn() never {
-                invalid();
+                @evm_invalid();
             };
             let abort = fn() never {
                 halt();
@@ -116,14 +116,14 @@ fn test_inline_closure_lowering() {
             preamble:
                 %0 = type:never
             body:
-                eval evm_stop()
+                eval @evm_stop()
                 ret void
         }
         @fn1() -> %0 {
             preamble:
                 %0 = type:never
             body:
-                eval invalid()
+                eval @evm_invalid()
                 ret void
         }
         @fn2() -> %0 {
@@ -200,9 +200,9 @@ fn test_return_in_fn_param_type_expression() {
     let rendered = render_diagnostics(
         r#"
         const f = fn (x: { return 0; u256 }) void {
-            evm_stop();
+            @evm_stop();
         };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
     );
     let expected = dedent_preserve_blank_lines(
@@ -228,7 +228,7 @@ fn test_fn_struct_return() {
 
         init {
             let x = swap(3, 4);
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -266,7 +266,7 @@ fn test_fn_struct_return() {
         %1 = 3
         %2 = 4
         %3 = call %0(%1, %2)
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -604,18 +604,16 @@ fn test_shadow_primitive_type() {
 
 #[test]
 fn test_shadow_builtin() {
-    let rendered = render_diagnostics(
-        r#"
-        init { let add = 1; }
-        "#,
-    );
+    let rendered = render_diagnostics("init { let @evm_add = 1; }");
     let expected = dedent_preserve_blank_lines(
         r#"
-        error: shadowing built-in function
+        error: unexpected builtin name
          --> main.plk:1:12
           |
-        1 | init { let add = 1; }
-          |            ^^^ 'add' is a built-in function
+        1 | init { let @evm_add = 1; }
+          |            ^^^^^^^^ unexpected builtin name, expected one of `mut`, identifier
+          |
+          = help: `@name` syntax is reserved for builtins and cannot be used as an identifier
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -644,7 +642,7 @@ fn test_non_call_reference_to_builtin() {
         r#"
         init {
             let mut x = 0;
-            x = add;
+            x = @evm_add;
         }
         "#,
     );
@@ -653,10 +651,106 @@ fn test_non_call_reference_to_builtin() {
         error: referencing built-in function as a value
          --> main.plk:3:9
           |
-        3 |     x = add;
-          |         ^^^ 'add' is a built-in function
+        3 |     x = @evm_add;
+          |         ^^^^^^^^ '@evm_add' is a built-in function
           |
           = help: built-in functions must be called directly, wrap in a function if you wish to use it as a first-class value
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_unknown_builtin_call() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let _ = @skibidi(1, 2);
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unknown builtin '@skibidi'
+         --> main.plk:2:13
+          |
+        2 |     let _ = @skibidi(1, 2);
+          |             ^^^^^^^^ no built-in function with this name
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_unknown_builtin_non_call() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let _ = @skibidi;
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unknown builtin '@skibidi'
+         --> main.plk:2:13
+          |
+        2 |     let _ = @skibidi;
+          |             ^^^^^^^^ no built-in function with this name
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_unknown_builtin_call_still_lowers_args() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let _ = @nonexistent(@other_unknown(1), foo);
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unknown builtin '@other_unknown'
+         --> main.plk:2:26
+          |
+        2 |     let _ = @nonexistent(@other_unknown(1), foo);
+          |                          ^^^^^^^^^^^^^^ no built-in function with this name
+        error: unresolved identifier 'foo'
+         --> main.plk:2:45
+          |
+        2 |     let _ = @nonexistent(@other_unknown(1), foo);
+          |                                             ^^^ not found in this scope
+        error: unknown builtin '@nonexistent'
+         --> main.plk:2:13
+          |
+        2 |     let _ = @nonexistent(@other_unknown(1), foo);
+          |             ^^^^^^^^^^^^ no built-in function with this name
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_at_ident_not_allowed_as_binding() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let @skibidi = 1;
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unexpected builtin name
+         --> main.plk:2:9
+          |
+        2 |     let @skibidi = 1;
+          |         ^^^^^^^^ unexpected builtin name, expected one of `mut`, identifier
+          |
+          = help: `@name` syntax is reserved for builtins and cannot be used as an identifier
         "#,
     );
     pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
@@ -709,7 +803,7 @@ fn test_logical_not_literal() {
         init {
             let x = !true;
             let y = !false;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -720,7 +814,7 @@ fn test_logical_not_literal() {
         %1 = logical_not %0
         %2 = false
         %3 = logical_not %2
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -730,10 +824,10 @@ fn test_logical_not_runtime() {
     assert_lowers_to(
         r#"
         init {
-            let c = calldataload(0);
-            let b = iszero(c);
+            let c = @evm_calldataload(0);
+            let b = @evm_iszero(c);
             let nb = !b;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -741,12 +835,12 @@ fn test_logical_not_runtime() {
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
+        %1 = @evm_calldataload(%0)
         %2 = %1
-        %3 = iszero(%2)
+        %3 = @evm_iszero(%2)
         %4 = %3
         %5 = logical_not %4
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -756,14 +850,14 @@ fn test_and_desugaring() {
     assert_lowers_to(
         r#"
         const slot_good = fn () bool {
-            sstore(0, 0);
+            @evm_sstore(0, 0);
             false
         };
 
         init {
-            let a = iszero(calldataload(0));
+            let a = @evm_iszero(@evm_calldataload(0));
             let c = a and slot_good();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -779,14 +873,14 @@ fn test_and_desugaring() {
             body:
                 %1 = 0
                 %2 = 0
-                eval sstore(%1, %2)
+                eval @evm_sstore(%1, %2)
                 ret false
         }
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
-        %2 = iszero(%1)
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
         %4 = %2
         if %4 {
             %5 = $0
@@ -795,7 +889,7 @@ fn test_and_desugaring() {
             %3 [br]= false
         }
         %6 = %3
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -805,12 +899,12 @@ fn test_or_desugaring() {
     assert_lowers_to(
         r#"
         init {
-            let a = iszero(calldataload(0));
+            let a = @evm_iszero(@evm_calldataload(0));
             let c = a or {
-                sstore(1, 1);
+                @evm_sstore(1, 1);
                 false
             };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -818,19 +912,19 @@ fn test_or_desugaring() {
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
-        %2 = iszero(%1)
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
         %4 = %2
         if %4 {
             %3 [br]= true
         } else {
             %5 = 1
             %6 = 1
-            eval sstore(%5, %6)
+            eval @evm_sstore(%5, %6)
             %3 [br]= false
         }
         %7 = %3
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -840,8 +934,8 @@ fn test_binary_op_lowering() {
     assert_lowers_to(
         r#"
         init {
-            let a = calldataload(0x00);
-            let b = calldataload(0x20);
+            let a = @evm_calldataload(0x00);
+            let b = @evm_calldataload(0x20);
             let c = a + b;
             let d = a -/ b;
             let e = a +/ b;
@@ -849,7 +943,7 @@ fn test_binary_op_lowering() {
             let g = a >/ b;
             let h = a *% b;
             let i = a << b;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -857,9 +951,9 @@ fn test_binary_op_lowering() {
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
+        %1 = @evm_calldataload(%0)
         %2 = 32
-        %3 = calldataload(%2)
+        %3 = @evm_calldataload(%2)
         %4 = %1
         %5 = %3
         %6 = (+) %4 %5
@@ -881,7 +975,7 @@ fn test_binary_op_lowering() {
         %22 = %1
         %23 = %3
         %24 = (<<) %22 %23
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -891,10 +985,10 @@ fn test_unary_op_lowering() {
     assert_lowers_to(
         r#"
         init {
-            let a = calldataload(0x00);
+            let a = @evm_calldataload(0x00);
             let b = -a;
             let c = ~a;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -902,12 +996,12 @@ fn test_unary_op_lowering() {
 
         ==== Init ====
         %0 = 0
-        %1 = calldataload(%0)
+        %1 = @evm_calldataload(%0)
         %2 = %1
         %3 = (-) %2
         %4 = %1
         %5 = (~) %4
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -918,7 +1012,7 @@ fn test_dependent_param_type() {
         r#"
         init {
             let f = fn (n: u256, x: n) u256 { x };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -938,7 +1032,7 @@ fn test_dependent_param_type() {
 
         ==== Init ====
         %0 = @fn0
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -949,7 +1043,7 @@ fn test_chained_dependent_params_with_comptime() {
         r#"
         init {
             let f = fn (comptime n: u256, y: n, z: y) n { z };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -971,7 +1065,7 @@ fn test_chained_dependent_params_with_comptime() {
 
         ==== Init ====
         %0 = @fn0
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -984,7 +1078,7 @@ fn test_self_ref_lower() {
             let x = 3;
             A
         };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         r#"
 
@@ -995,7 +1089,7 @@ fn test_self_ref_lower() {
         }
 
         ==== Init ====
-        eval evm_stop()
+        eval @evm_stop()
        "#,
     );
 }
@@ -1007,7 +1101,7 @@ fn test_lone_slash_not_supported() {
         init {
             let a = 10;
             let b = a / 2;
-            evm_stop();
+            @evm_stop();
         }
         "#,
     );
@@ -1039,10 +1133,52 @@ fn test_lone_slash_not_supported() {
         %1 = %0
         %2 = 2
         %3 = (</) %1 %2
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
     pretty_assertions::assert_str_eq!(actual_hir.trim(), expected_hir.trim());
+}
+
+#[test]
+fn test_builtin_name_without_at_is_valid_identifier() {
+    assert_lowers_to(
+        r#"
+        init {
+            let is_struct = 1;
+            let field_count = is_struct;
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 1
+        %1 = %0
+        "#,
+    );
+}
+
+#[test]
+fn test_unresolved_bare_builtin_name_suggests_at() {
+    let rendered = render_diagnostics(
+        r#"
+        init {
+            let x = evm_add(1, 2);
+        }
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: unresolved identifier 'evm_add'
+         --> main.plk:2:13
+          |
+        2 |     let x = evm_add(1, 2);
+          |             ^^^^^^^ not found in this scope
+          |
+          = help: if you meant the builtin, use `@evm_add`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }
 
 #[test]
@@ -1050,7 +1186,7 @@ fn test_import_group_unresolved_item() {
     let project = TestProject::root(
         r#"
         import m::other::{a, b};
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
     )
     .add_file(
@@ -1082,7 +1218,7 @@ fn test_import_group_collision_with_local() {
         r#"
         const x = 1;
         import m::other::{a, b as x};
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
     )
     .add_file(
@@ -1114,7 +1250,7 @@ fn test_import_group_collision_with_other_import() {
         r#"
         import m::a::x;
         import m::b::{y, x};
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
     )
     .add_file(
@@ -1151,7 +1287,7 @@ fn test_import_group_self_collision() {
     let project = TestProject::root(
         r#"
         import m::other::{a as x, b as x};
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
     )
     .add_file(
@@ -1182,9 +1318,9 @@ fn test_explicit_return_in_function() {
     assert_lowers_to(
         r#"
         const add_one = fn (x: u256) u256 {
-            return add(x, 1);
+            return @evm_add(x, 1);
         };
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         r#"
         ==== Constants ====
@@ -1201,12 +1337,12 @@ fn test_explicit_return_in_function() {
             body:
                 %3 = %1
                 %4 = 1
-                ret add(%3, %4)
+                ret @evm_add(%3, %4)
                 ret void
         }
 
         ==== Init ====
-        eval evm_stop()
+        eval @evm_stop()
         "#,
     );
 }
@@ -1215,9 +1351,9 @@ fn test_explicit_return_in_function() {
 fn test_return_outside_function_body() {
     let source = r#"
         init {
-            let a = add(1, 2);
+            let a = @evm_add(1, 2);
             return a;
-            let b = add(3, 4);
+            let b = @evm_add(3, 4);
         }
     "#;
 
@@ -1243,11 +1379,11 @@ fn test_return_outside_function_body() {
         ==== Init ====
         %0 = 1
         %1 = 2
-        %2 = add(%0, %1)
+        %2 = @evm_add(%0, %1)
         eval %2
         %3 = 3
         %4 = 4
-        %5 = add(%3, %4)
+        %5 = @evm_add(%3, %4)
         "#,
     );
     pretty_assertions::assert_str_eq!(actual_hir.trim(), expected_hir.trim());

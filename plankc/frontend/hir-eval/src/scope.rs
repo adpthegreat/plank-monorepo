@@ -6,7 +6,9 @@ use crate::{
 use plank_core::{DenseIndexMap, IndexVec};
 use plank_hir::{self as hir, ExprKind, InstructionKind, operators as hir_ops};
 use plank_mir as mir;
-use plank_session::{EvmBuiltin, MaybePoisoned, Poisoned, SourceId, SourceSpan, SrcLoc, poison};
+use plank_session::{
+    MaybePoisoned, Poisoned, RuntimeBuiltin, SourceId, SourceSpan, SrcLoc, poison,
+};
 use plank_values::{DefOrigin, TypeId, Value, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,7 +574,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             LocalState::Runtime(mir) => {
                 let args = self.mir_args.push_copy_slice(&[mir]);
                 EvalValue::Runtime {
-                    expr: mir::Expr::BuiltinCall { builtin: EvmBuiltin::IsZero, args },
+                    expr: mir::Expr::RuntimeBuiltinCall { builtin: RuntimeBuiltin::IsZero, args },
                     result_type: TypeId::BOOL,
                 }
             }
@@ -586,8 +588,8 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     pub fn eval_expr(&mut self, expr: hir::Expr) -> Result<MaybePoisoned<EvalValue>, Diverge> {
         let value = match expr.kind {
             ExprKind::Value(maybe_vid) => maybe_vid.map(EvalValue::Comptime),
-            ExprKind::EvmBuiltinCall { builtin, args } => {
-                poison::transpose(self.eval_builtin(builtin, args, expr.span))?
+            ExprKind::BuiltinCall { builtin, args } => {
+                poison::transpose(self.eval_builtin_call(builtin, args, expr.span))?
             }
             ExprKind::LocalRef(local) => self.bindings[local].state.map(|state| match state {
                 LocalState::Comptime(vid) => EvalValue::Comptime(vid),
@@ -604,7 +606,6 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 .eval_struct_def(struct_def_id, expr.span)
                 .map(|ty| EvalValue::Comptime(self.values.intern_type(ty))),
             ExprKind::BinaryOpCall { op: hir_ops::BinaryOp::Equals, lhs, rhs } => {
-                // TODO: Implement proper operator
                 let lhs = self.bindings[lhs].state.and_then(|lhs| {
                     let LocalState::Comptime(value) = lhs else { return Err(Poisoned) };
                     let Value::Type(ty) = self.values.lookup(value) else { return Err(Poisoned) };

@@ -1,5 +1,7 @@
 use plank_core::Span;
-use plank_session::{AnnotationKind, Annotations, ClaimBuilder, Diagnostic, SourceSpan};
+use plank_session::{
+    AnnotationKind, Annotations, ClaimBuilder, DiagEmitter, Diagnostic, SourceSpan,
+};
 
 use crate::lexer::{ErrorToken, Token, TokenIdx};
 
@@ -33,6 +35,11 @@ impl<'a> Parser<'a> {
             .help("decimal literals may only contain digits 0-9 and '_'")
             .help("hex literals must begin with '0x' and may only contain 0-9, A-F, a-f and '_'")
             .help("binary literals must begin with '0b' and may only contain 0, 1 and '_'"),
+            ErrorToken::AtWithoutIdent => Diagnostic::error("invalid builtin name").primary(
+                self.source_id,
+                span,
+                "expected identifier after `@`",
+            ),
             ErrorToken::UnclosedBlockComment => {
                 let mut diag = Diagnostic::error("unclosed block comment").primary(
                     self.source_id,
@@ -61,6 +68,18 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn emit_unexpected_token(&mut self, found: Token, span: SourceSpan) {
+        let diagnostic = self.build_unexpected_diagnostic(found, span);
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    pub(crate) fn emit_builtin_name_used_as_ident(&mut self, span: SourceSpan) {
+        let diagnostic = self
+            .build_unexpected_diagnostic(Token::BuiltinName, span)
+            .help("`@name` syntax is reserved for builtins and cannot be used as an identifier");
+        self.session.emit_diagnostic(diagnostic);
+    }
+
+    fn build_unexpected_diagnostic(&self, found: Token, span: SourceSpan) -> Diagnostic {
         use std::fmt::Write;
         let mut label = String::with_capacity(30 + self.expected.len() * 12);
         write!(&mut label, "unexpected {}, expected ", found).unwrap();
@@ -74,9 +93,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Diagnostic::error(format!("unexpected {}", found))
-            .primary(self.source_id, span, label)
-            .emit(self.session);
+        Diagnostic::error(format!("unexpected {}", found)).primary(self.source_id, span, label)
     }
 
     pub(crate) fn emit_missing_token(&mut self, missing: Token, span: SourceSpan) {

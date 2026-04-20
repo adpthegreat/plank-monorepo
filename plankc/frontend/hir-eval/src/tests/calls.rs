@@ -10,7 +10,7 @@ fn test_preamble_error_per_call_site() {
             f();
             f();
             f();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[
@@ -75,7 +75,7 @@ fn test_never_fn_return_type_mismatch_diverges() {
                 bad_ret();
             }
             let x: u256 = false;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -95,26 +95,26 @@ fn test_if_both_branches_never_function_diverges() {
     assert_diagnostics(
         r#"
         const bad_stop = fn() never {
-            comptime { evm_stop(); }
-            evm_stop();
+            comptime { @evm_stop(); }
+            @evm_stop();
         };
         init {
-            let x = calldataload(0);
-            if eq(x, 0) {
+            let x = @evm_calldataload(0);
+            if @evm_eq(x, 0) {
                 bad_stop();
             } else {
                 bad_stop();
             }
             let y: bool = 0;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
         error: builtin not supported at compile time
          --> main.plk:2:16
           |
-        2 |     comptime { evm_stop(); }
-          |                ^^^^^^^^^^ `evm_stop` cannot be evaluated at compile time
+        2 |     comptime { @evm_stop(); }
+          |                ^^^^^^^^^^^ `@evm_stop` cannot be evaluated at compile time
         "#],
     );
 }
@@ -124,26 +124,26 @@ fn test_runtime_never_fn_call_diverges_on_cached_hit() {
     assert_diagnostics(
         r#"
         const bad_stop = fn() never {
-            comptime { evm_stop(); }
-            evm_stop();
+            comptime { @evm_stop(); }
+            @evm_stop();
         };
         init {
-            let x = calldataload(0);
-            if eq(x, 0) {
+            let x = @evm_calldataload(0);
+            if @evm_eq(x, 0) {
                 bad_stop();
             } else {
                 bad_stop();
                 let y: bool = 0;
             }
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
         error: builtin not supported at compile time
          --> main.plk:2:16
           |
-        2 |     comptime { evm_stop(); }
-          |                ^^^^^^^^^^ `evm_stop` cannot be evaluated at compile time
+        2 |     comptime { @evm_stop(); }
+          |                ^^^^^^^^^^^ `@evm_stop` cannot be evaluated at compile time
         "#],
     );
 }
@@ -153,7 +153,7 @@ fn test_runtime_call_arg_type_mismatch() {
     assert_diagnostics(
         r#"
         init {
-            let f = fn(x: u256) never { evm_stop(); };
+            let f = fn(x: u256) never { @evm_stop(); };
             f(false);
         }
         "#,
@@ -161,7 +161,7 @@ fn test_runtime_call_arg_type_mismatch() {
         error: mismatched types
          --> main.plk:3:7
           |
-        2 |     let f = fn(x: u256) never { evm_stop(); };
+        2 |     let f = fn(x: u256) never { @evm_stop(); };
           |                   ---- `u256` expected because of this
         3 |     f(false);
           |       ^^^^^ expected `u256`, got `bool`
@@ -175,7 +175,7 @@ fn test_comptime_call_on_non_function() {
         r#"
         const x = 5;
         const y = x();
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: expected function
@@ -194,9 +194,9 @@ fn test_call_target_not_comptime() {
     assert_diagnostics(
         r#"
         init {
-            let f = calldataload(0);
+            let f = @evm_calldataload(0);
             f();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -218,7 +218,7 @@ fn test_runtime_call_on_non_function() {
         init {
             let x = 5;
             x();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -239,7 +239,7 @@ fn test_same_file_not_callable() {
 
         init {
             x();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -263,7 +263,7 @@ fn test_cross_file_not_callable() {
             import m::other::x;
             init {
                 x();
-                evm_stop();
+                @evm_stop();
             }
             ",
         )
@@ -291,7 +291,7 @@ fn test_runtime_call_arg_count_mismatch() {
         const foo = fn(x: u256) u256 { return x; };
         init {
             foo(1, 2);
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -311,16 +311,16 @@ fn test_runtime_call_arg_count_mismatch() {
 fn test_const_poisoned_never_crashes() {
     assert_diagnostics(
         r#"
-        const f = fn() never { evm_stop(); };
+        const f = fn() never { @evm_stop(); };
         const x = f();
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: builtin not supported at compile time
          --> main.plk:1:24
           |
-        1 | const f = fn() never { evm_stop(); };
-          |                        ^^^^^^^^^^ `evm_stop` cannot be evaluated at compile time
+        1 | const f = fn() never { @evm_stop(); };
+          |                        ^^^^^^^^^^^ `@evm_stop` cannot be evaluated at compile time
         "#],
     );
 }
@@ -331,7 +331,7 @@ fn test_comptime_call_arg_count_mismatch() {
         r#"
         const f = fn(x: u256) u256 { return x; };
         const r = f(1, 2);
-        init { evm_stop(); }
+        init { @evm_stop(); }
         "#,
         &[r#"
         error: wrong number of arguments
@@ -348,14 +348,14 @@ fn test_comptime_call_arg_count_mismatch() {
 #[test]
 fn test_cross_file_call_arg_count_mismatch() {
     assert_project_diagnostics(
-        TestProject::root("import m::other::f;\ninit { f(1, 2); evm_stop(); }")
+        TestProject::root("import m::other::f;\ninit { f(1, 2); @evm_stop(); }")
             .add_file("other", "const f = fn(x: u256) u256 { return x; };")
             .add_module("m", ""),
         &[r#"
         error: wrong number of arguments
          --> main.plk:2:8
           |
-        2 | init { f(1, 2); evm_stop(); }
+        2 | init { f(1, 2); @evm_stop(); }
           |        ^^^^^^^ expected 1 argument, got 2
           |
          ::: other.plk:1:13
@@ -371,18 +371,18 @@ fn test_no_matching_builtin_signature() {
     assert_diagnostics(
         r#"
         init {
-            add(true, false);
-            evm_stop();
+            @evm_add(true, false);
+            @evm_stop();
         }
         "#,
         &[r#"
         error: no valid match for builtin signature
          --> main.plk:2:5
           |
-        2 |     add(true, false);
-          |     ^^^^^^^^^^^^^^^^ `add` cannot be called with (bool, bool)
+        2 |     @evm_add(true, false);
+          |     ^^^^^^^^^^^^^^^^^^^^^ `@evm_add` cannot be called with (bool, bool)
           |
-          = note: `add` accepts (u256, u256), (memptr, u256), (u256, memptr)
+          = note: `@evm_add` accepts (u256, u256), (memptr, u256), (u256, memptr)
         "#],
     );
 }
@@ -392,18 +392,18 @@ fn test_builtin_wrong_arg_count() {
     assert_diagnostics(
         r#"
         init {
-            add(1);
-            evm_stop();
+            @evm_add(1);
+            @evm_stop();
         }
         "#,
         &[r#"
         error: wrong number of arguments
          --> main.plk:2:5
           |
-        2 |     add(1);
-          |     ^^^^^^ `add` called with 1 argument, but requires 2
+        2 |     @evm_add(1);
+          |     ^^^^^^^^^^^ `@evm_add` called with 1 argument, but requires 2
           |
-          = note: `add` accepts (u256, u256), (memptr, u256), (u256, memptr)
+          = note: `@evm_add` accepts (u256, u256), (memptr, u256), (u256, memptr)
         "#],
     );
 }
@@ -413,17 +413,17 @@ fn test_closure_capture_not_comptime() {
     assert_diagnostics(
         r#"
         init {
-            let x = calldataload(0);
+            let x = @evm_calldataload(0);
             let f = fn() u256 { x };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
         error: closure capture must be known at compile time
          --> main.plk:3:25
           |
-        2 |     let x = calldataload(0);
-          |             --------------- defined here
+        2 |     let x = @evm_calldataload(0);
+          |             -------------------- defined here
         3 |     let f = fn() u256 { x };
           |                         ^ capture of runtime value
           |
@@ -439,7 +439,7 @@ fn test_cross_file_type_mismatch() {
             "
             import m::other::f;
             const y = f(true);
-            init { evm_stop(); }
+            init { @evm_stop(); }
             ",
         )
         .add_file("other", "const f = fn(x: u256) u256 { return x; };")
@@ -468,7 +468,7 @@ fn test_import_group_symbols_accessible() {
             init {
                 let x = f(1);
                 let y = my_g(2, 3);
-                evm_stop();
+                @evm_stop();
             }
         "#,
         )
@@ -499,7 +499,7 @@ fn test_import_group_symbols_accessible() {
             %2 : u256 = 2
             %3 : u256 = 3
             %4 : u256 = call @fn1(%2, %3)
-            %5 : never = evm_stop()
+            %5 : never = @evm_stop()
         }
         "#,
     );
@@ -534,11 +534,11 @@ fn test_runtime_recursion_with_terminator_still_emits_recursion_diagnostic() {
         r#"
         const f = fn() never {
             f();
-            evm_stop();
+            @evm_stop();
         };
         init {
             f();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -565,7 +565,7 @@ fn test_nested_preamble_errors_point_at_correct_call_sites() {
         };
         init {
             outer();
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[
@@ -608,7 +608,7 @@ fn test_nested_preamble_errors_point_at_correct_call_sites() {
 fn test_inconsistent_premable() {
     assert_diagnostics(
         r#"
-        const even = fn (x: u256) bool { eq(raw_mod(x, 2), 0) };
+        const even = fn (x: u256) bool { @evm_eq(@evm_mod(x, 2), 0) };
 
         const not_a_type = {};
 
@@ -620,7 +620,7 @@ fn test_inconsistent_premable() {
             let mut fine = weird(3);
             let mut nope = weird(2);
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -652,7 +652,7 @@ fn test_duplicate_body_error_runtime() {
             simple();
             simple();
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -683,7 +683,7 @@ fn test_duplicate_body_error_comptime() {
 
             }
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
@@ -703,10 +703,10 @@ fn test_comptime_calls_cache_correctly() {
     assert_lowers_to(
         r#"
         const fib_inner = fn (n: u256, a: u256, b: u256) u256 {
-            if iszero(n) {
+            if @evm_iszero(n) {
                 return a;
             }
-            fib_inner(sub(n, 1), b, add(a, b))
+            fib_inner(@evm_sub(n, 1), b, @evm_add(a, b))
         };
         const fib = fn (n: u256) u256 {
             fib_inner(n, 0, 1)
@@ -719,7 +719,7 @@ fn test_comptime_calls_cache_correctly() {
             let mut f10 = comptime { fib(11) };
             let mut f10 = comptime { fib(11) };
             let mut f10 = comptime { fib(11) };
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -732,7 +732,7 @@ fn test_comptime_calls_cache_correctly() {
             %3 : u256 = 89
             %4 : u256 = 89
             %5 : u256 = 89
-            %6 : never = evm_stop()
+            %6 : never = @evm_stop()
         }
         "#,
     );
@@ -742,7 +742,7 @@ fn test_comptime_calls_cache_correctly() {
 fn test_comptime_diverge_prevents_cascade() {
     assert_diagnostics(
         r#"
-        const stop = fn () never { evm_stop() };
+        const stop = fn () never { @evm_stop() };
 
         const a = stop();
 
@@ -753,15 +753,15 @@ fn test_comptime_diverge_prevents_cascade() {
             }
             let x: u256 = false;
 
-            evm_stop();
+            @evm_stop();
         }
         "#,
         &[r#"
         error: builtin not supported at compile time
          --> main.plk:1:28
           |
-        1 | const stop = fn () never { evm_stop() };
-          |                            ^^^^^^^^^^ `evm_stop` cannot be evaluated at compile time
+        1 | const stop = fn () never { @evm_stop() };
+          |                            ^^^^^^^^^^^ `@evm_stop` cannot be evaluated at compile time
         "#],
     );
 }
@@ -775,7 +775,7 @@ fn test_runtime_comptime_only_arg() {
             f(type, 3);
             f(type, 4);
             f(u256, 5);
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -798,7 +798,7 @@ fn test_runtime_comptime_only_arg() {
             %3 : u256 = call @fn0(%2)
             %4 : u256 = 5
             %5 : u256 = call @fn1(%4)
-            %6 : never = evm_stop()
+            %6 : never = @evm_stop()
         }
         "#,
     );
@@ -809,11 +809,11 @@ fn test_comptime_ret_forces_arg_comptime() {
     assert_lowers_to(
         r#"
         const f = fn(comptime T: type, x: u256) type {
-            if eq(x, 0) { T } else { bool }
+            if @evm_eq(x, 0) { T } else { bool }
         };
         init {
             let mut a: f(u256, comptime { 0 }) = 34;
-            evm_stop();
+            @evm_stop();
         }
         "#,
         r#"
@@ -821,7 +821,7 @@ fn test_comptime_ret_forces_arg_comptime() {
         ; init
         @fn0() -> never {
             %0 : u256 = 34
-            %1 : never = evm_stop()
+            %1 : never = @evm_stop()
         }
         "#,
     );
