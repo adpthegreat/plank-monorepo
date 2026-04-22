@@ -593,3 +593,156 @@ fn test_logical_not() {
         "#,
     );
 }
+
+#[test]
+fn test_uninit_struct() {
+    assert_lowers_to(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        const p = @uninit(Pair);
+        const field_a = @get_field(p, 0);
+        const p2 = @set_field(p, 0, field_a);
+        const p3 = @set_field(p2, 1, true);
+        init {
+            let mut a: u256 = p3.a;
+            let mut b: bool = p3.b;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $0 = const 0x0
+                $1 = const 0x1
+                stop
+            }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_memptr() {
+    assert_lowers_to(
+        r#"
+        const Buf = struct { ptr_a: memptr, ptr_b: memptr };
+        init {
+            let b = @uninit(Buf);
+            let mut a: memptr = b.ptr_a;
+            let mut c: memptr = b.ptr_b;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $0 = const 0x0
+                $1 = mallocany $0
+                $2 = const 0x0
+                $3 = mallocany $2
+                $4 = copy $1
+                $5 = copy $3
+                $6 = copy $4
+                $7 = copy $5
+                $8 = copy $6
+                $9 = copy $7
+                $10 = copy $8
+                $11 = copy $6
+                $12 = copy $7
+                $13 = copy $12
+                stop
+            }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_void_field() {
+    assert_lowers_to(
+        r#"
+        const Inner = struct { a: u256, b: void };
+        const x = @uninit(Inner);
+        init {
+            let mut a: u256 = x.a;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $0 = const 0x0
+                stop
+            }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_type() {
+    assert_lowers_to(
+        r#"
+        const x = @uninit(@uninit(type));
+        const f = fn () @uninit(type) {};
+        init {
+            f();
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @1
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+            fn @1 -> entry @1  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                iret
+            }
+
+            @1 {
+                icall @0
+                stop
+            }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_primitives() {
+    assert_lowers_to(
+        r#"
+        init {
+            let mut a: u256 = @uninit(u256);
+            let mut b: bool = @uninit(bool);
+            let mut c: memptr = @uninit(memptr);
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $0 = const 0x0
+                $1 = const 0x0
+                $2 = const 0x0
+                $3 = mallocany $2
+                $4 = copy $3
+                stop
+            }
+        "#,
+    );
+}

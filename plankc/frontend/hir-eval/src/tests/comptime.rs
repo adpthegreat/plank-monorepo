@@ -1187,3 +1187,121 @@ fn test_set_field_comptime_only_struct_runtime_value() {
         "#],
     );
 }
+
+#[test]
+fn test_uninit_struct_runtime_set_field() {
+    assert_lowers_to(
+        r#"
+        const Pair = struct { a: u256, b: u256 };
+        const p = @uninit(Pair);
+        init {
+            let val: u256 = @evm_calldataload(0);
+            let p2 = @set_field(p, 0, val);
+            let mut a: u256 = p2.a;
+            let mut b: u256 = p2.b;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 0
+            %1 : u256 = @evm_calldataload(%0)
+            %2 : u256 = %1
+            %3 : Pair = struct#0 {
+                0,
+                0,
+            }
+            %4 : u256 = %3.1
+            %5 : Pair = Pair { %2, %4 }
+            %6 : Pair = %5
+            %7 : u256 = %6.0
+            %8 : Pair = %5
+            %9 : u256 = %8.1
+            %10 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_invalid_type() {
+    assert_diagnostics(
+        r#"
+        const x = @uninit(never);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: cannot create uninitialized value
+         --> main.plk:1:11
+          |
+        1 | const x = @uninit(never);
+          |           ^^^^^^^^^^^^^^ type 'never' cannot be uninitialized
+          |
+          = help: @uninit only supports u256, bool, void, type, memptr and struct types
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_type_spilled_to_runtime() {
+    assert_diagnostics(
+        r#"
+        const t = @uninit(type);
+        init {
+            let mut x = t;
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: use of comptime-only value at runtime
+         --> main.plk:3:17
+          |
+        3 |     let mut x = t;
+          |                 ^ reference to comptime-only value
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_function_field() {
+    assert_diagnostics(
+        r#"
+        const Bad = struct { a: u256, b: function };
+        const x = @uninit(Bad);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: struct contains field that cannot be uninitialized
+         --> main.plk:2:11
+          |
+        2 | const x = @uninit(Bad);
+          |           ^^^^^^^^^^^^ cannot use @uninit on this struct
+          |
+         ::: main.plk:1:31
+          |
+        1 | const Bad = struct { a: u256, b: function };
+          |                               ----------- type 'function' cannot be uninitialized
+          |
+          = help: @uninit only supports u256, bool, void, type, memptr and struct types
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_memptr_in_comptime() {
+    assert_diagnostics(
+        r#"
+        const x = @uninit(memptr);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: cannot use @uninit on memptr type at comptime
+         --> main.plk:1:11
+          |
+        1 | const x = @uninit(memptr);
+          |           ^^^^^^^^^^^^^^^ memptr requires runtime allocation
+        "#],
+    );
+}

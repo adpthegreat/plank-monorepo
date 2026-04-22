@@ -3,11 +3,15 @@ use plank_hir as hir;
 use plank_mir as mir;
 use plank_session::{Builtin, MaybePoisoned, RuntimeBuiltin, SourceSpan, builtins::BuiltinKind};
 use plank_values::{
-    Field, StructView, Type, TypeId, Value, ValueId, ValueInterner, builtins as builtin_sigs,
+    Field, PrimitiveType, StructView, Type, TypeId, TypeInterner, Value, ValueId, ValueInterner,
+    builtins as builtin_sigs,
 };
 
-use crate::scope::{Diverge, EvalValue, LocalState, Scope};
-use plank_session::Poisoned;
+use crate::{
+    diagnostics::DiagCtx,
+    scope::{Diverge, EvalValue, LocalState, Scope},
+};
+use plank_session::{Poisoned, SrcLoc};
 
 impl<'a, 'ctx> Scope<'a, 'ctx> {
     pub(crate) fn eval_builtin_call(
@@ -27,7 +31,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             builtin => match builtin.kind() {
                 BuiltinKind::Comptime => self.eval_comptime_builtin(builtin, args, expr_span),
                 BuiltinKind::ComptimeDynamic { .. } => {
-                    self.eval_comptime_polymorphic_builtin(builtin, args, expr_span)
+                    self.eval_comptime_dynamic_builtin(builtin, args, expr_span)
                 }
                 BuiltinKind::RuntimeFoldable | BuiltinKind::RuntimeOnly => {
                     unreachable!("already matched")
@@ -187,7 +191,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         }
     }
 
-    fn eval_comptime_polymorphic_builtin(
+    fn eval_comptime_dynamic_builtin(
         &mut self,
         builtin: Builtin,
         args: hir::CallArgsId,
@@ -205,7 +209,8 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             Builtin::FieldType => self.eval_field_type(hir_args, builtin, expr_span),
             Builtin::GetField => self.eval_get_field(hir_args, builtin, expr_span),
             Builtin::SetField => self.eval_set_field(hir_args, builtin, expr_span),
-            _ => unreachable!("not a comptime polymorphic builtin: {builtin}"),
+            Builtin::Uninit => self.eval_uninit(hir_args, builtin, expr_span),
+            _ => unreachable!("not a comptime dynamic builtin: {builtin}"),
         }
     }
 
@@ -235,12 +240,12 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             self.resolve_struct_field_index(ty, field_index, builtin, expr_span)?;
 
         match instance_state {
-            LocalState::Comptime(vid) => {
-                let Value::StructVal { ty: _, fields } = self.values.lookup(vid) else {
-                    unreachable!("invariant: type checked as struct")
-                };
-                Ok(Ok(EvalValue::Comptime(fields[field_index as usize])))
-            }
+            LocalState::Comptime(vid) => match self.values.lookup(vid) {
+                Value::StructVal { fields, .. } => {
+                    Ok(Ok(EvalValue::Comptime(fields[field_index as usize])))
+                }
+                _ => unreachable!("invariant: type checked as struct"),
+            },
             LocalState::Runtime(local) => Ok(Ok(EvalValue::Runtime {
                 expr: mir::Expr::FieldAccess { object: local, field_index },
                 result_type: field.ty,
@@ -280,24 +285,21 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             (instance_state, new_value_state)
         {
             return Ok(self.with_values_buf(|this, values_buf_offset| {
-                let Value::StructVal { ty: _, fields: old_fields } =
-                    this.eval.values.lookup(instance_vid)
-                else {
-                    unreachable!("invariant: type checked as struct")
-                };
-                this.eval.values_buf.extend_from_slice(old_fields);
-                this.eval.values_buf[values_buf_offset + field_index as usize] = new_value_vid;
-                let new_fields = &this.eval.values_buf[values_buf_offset..];
+                match this.eval.values.lookup(instance_vid) {
+                    Value::StructVal { fields: old_fields, .. } => {
+                        this.eval.values_buf.extend_from_slice(old_fields);
+                    }
+                    _ => unreachable!("invariant: type checked as struct"),
+                }
+                let fields = &mut this.eval.values_buf[values_buf_offset..];
+                fields[field_index as usize] = new_value_vid;
                 Ok(EvalValue::Comptime(
-                    this.eval
-                        .values
-                        .intern(Value::StructVal { ty: instance_ty, fields: new_fields }),
+                    this.eval.values.intern(Value::StructVal { ty: instance_ty, fields }),
                 ))
             }));
         }
 
         // At least one side is runtime: emit MIR.
-
         if self.eval.types.is_comptime_only(instance_ty) {
             self.diag_ctx.emit_set_field_on_comptime_only_struct(
                 instance_ty,
@@ -310,20 +312,20 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         let instance_local = self.materialize_as_local(instance_state, instance_ty);
         let mir_fields = self.with_locals_buf(|this, locals_buf_offset| {
             for (cur_field_idx, &field) in (0..).zip(r#struct.fields) {
-                let local = if cur_field_idx == field_index {
-                    this.materialize_as_local(new_value_state, expected_field_type)
-                } else {
-                    let target = this.mir_types.push(field.ty);
-                    this.emit(mir::Instruction::Set {
-                        target,
-                        expr: mir::Expr::FieldAccess {
-                            object: instance_local,
-                            field_index: cur_field_idx,
-                        },
-                    });
-                    target
-                };
-                this.locals_buf.push(local);
+                if cur_field_idx == field_index {
+                    let local = this.materialize_as_local(new_value_state, expected_field_type);
+                    this.locals_buf.push(local);
+                    continue;
+                }
+                let target = this.mir_types.push(field.ty);
+                this.emit(mir::Instruction::Set {
+                    target,
+                    expr: mir::Expr::FieldAccess {
+                        object: instance_local,
+                        field_index: cur_field_idx,
+                    },
+                });
+                this.locals_buf.push(target);
             }
             this.eval.mir_args.push_copy_slice(&this.eval.locals_buf[locals_buf_offset..])
         });
@@ -332,6 +334,99 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             expr: mir::Expr::StructLit { ty: instance_ty, fields: mir_fields },
             result_type: instance_ty,
         }))
+    }
+
+    fn eval_uninit(
+        &mut self,
+        args: &[hir::LocalId],
+        builtin: Builtin,
+        expr_span: SourceSpan,
+    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
+        let &[ty_local] = args else { unreachable!("arg count checked") };
+        let ty = self.expect_type_arg(ty_local, builtin, expr_span)?;
+        if validate_uninit_type(ty, self.eval.types, self.diag_ctx, self.loc(expr_span), None) {
+            return Err(Poisoned);
+        }
+
+        // Types that require runtime allocation (memptr, structs containing memptr)
+        // produce MIR directly.
+        if contains_memptr(ty, self.eval.types) {
+            if self.is_comptime() {
+                self.diag_ctx.emit_uninit_memptr_in_comptime(self.loc(expr_span));
+                return Err(Poisoned);
+            }
+            return Ok(Ok(self.emit_uninit_runtime(ty)));
+        }
+
+        Ok(Ok(EvalValue::Comptime(build_uninit_comptime(
+            ty,
+            self.eval.types,
+            self.eval.values,
+            &mut self.eval.values_buf,
+        ))))
+    }
+
+    /// Emits MIR instructions for a runtime uninit value (memptr or struct containing memptr).
+    fn emit_uninit_runtime(&mut self, ty: TypeId) -> EvalValue {
+        let local = self.emit_uninit_runtime_local(ty);
+        EvalValue::Runtime { expr: mir::Expr::LocalRef(local), result_type: ty }
+    }
+
+    fn emit_uninit_runtime_local(&mut self, ty: TypeId) -> mir::LocalId {
+        match ty.as_primitive() {
+            Ok(PrimitiveType::U256) => {
+                let target = self.mir_types.push(TypeId::U256);
+                self.emit(mir::Instruction::Set { target, expr: mir::Expr::Const(ValueId::ZERO) });
+                target
+            }
+            Ok(PrimitiveType::Bool) => {
+                let target = self.mir_types.push(TypeId::BOOL);
+                self.emit(mir::Instruction::Set { target, expr: mir::Expr::Const(ValueId::FALSE) });
+                target
+            }
+            Ok(PrimitiveType::MemoryPointer) => {
+                let size_local = self.mir_types.push(TypeId::U256);
+                self.emit(mir::Instruction::Set {
+                    target: size_local,
+                    expr: mir::Expr::Const(ValueId::ZERO),
+                });
+                let args = self.eval.mir_args.push_copy_slice(&[size_local]);
+                let target = self.mir_types.push(TypeId::MEMORY_POINTER);
+                self.emit(mir::Instruction::Set {
+                    target,
+                    expr: mir::Expr::RuntimeBuiltinCall {
+                        builtin: RuntimeBuiltin::DynamicAllocAnyBytes,
+                        args,
+                    },
+                });
+                target
+            }
+            Ok(PrimitiveType::Void) => {
+                let target = self.mir_types.push(TypeId::VOID);
+                self.emit(mir::Instruction::Set { target, expr: mir::Expr::Const(ValueId::VOID) });
+                target
+            }
+            Ok(PrimitiveType::Type | PrimitiveType::Function | PrimitiveType::Never) => {
+                unreachable!("void/type/function/never do not produce runtime locals")
+            }
+            Err(struct_ref) => {
+                let fields = self.with_locals_buf(|this, offset| {
+                    let view = this.eval.types.lookup_struct(struct_ref);
+                    for field in view.fields {
+                        let local = this.emit_uninit_runtime_local(field.ty);
+                        this.locals_buf.push(local);
+                    }
+                    this.eval.mir_args.push_copy_slice(&this.eval.locals_buf[offset..])
+                });
+                let struct_ty = TypeId::from_struct(struct_ref);
+                let target = self.mir_types.push(struct_ty);
+                self.emit(mir::Instruction::Set {
+                    target,
+                    expr: mir::Expr::StructLit { ty: struct_ty, fields },
+                });
+                target
+            }
+        }
     }
 
     fn resolve_struct_field_index(
@@ -482,9 +577,85 @@ fn fold_runtime_builtin(
     }
 }
 
+fn validate_uninit_type(
+    ty: TypeId,
+    types: &TypeInterner,
+    diag_ctx: &mut DiagCtx<'_>,
+    loc: SrcLoc,
+    field_loc: Option<SrcLoc>,
+) -> bool {
+    match ty.as_primitive() {
+        Ok(
+            PrimitiveType::U256
+            | PrimitiveType::Bool
+            | PrimitiveType::MemoryPointer
+            | PrimitiveType::Void
+            | PrimitiveType::Type,
+        ) => false,
+        Ok(invalid @ (PrimitiveType::Function | PrimitiveType::Never)) => {
+            // `field_loc` is set when recursing into struct fields
+            if let Some(field_loc) = field_loc {
+                diag_ctx.emit_invalid_uninit_struct_field(invalid, loc, field_loc);
+            } else {
+                diag_ctx.emit_invalid_uninit_type(invalid, loc);
+            }
+            true
+        }
+        Err(struct_ref) => {
+            let view = types.lookup_struct(struct_ref);
+            let mut has_invalid_uninit = false;
+            for field in view.fields {
+                let field_loc = SrcLoc::new(view.def_loc.source, field.def_span);
+                has_invalid_uninit |=
+                    validate_uninit_type(field.ty, types, diag_ctx, loc, Some(field_loc));
+            }
+            has_invalid_uninit
+        }
+    }
+}
+
+fn contains_memptr(ty: TypeId, types: &TypeInterner) -> bool {
+    match ty.as_primitive() {
+        Ok(PrimitiveType::MemoryPointer) => true,
+        Ok(_) => false,
+        Err(struct_ref) => {
+            let view = types.lookup_struct(struct_ref);
+            view.fields.iter().any(|f| contains_memptr(f.ty, types))
+        }
+    }
+}
+
+fn build_uninit_comptime(
+    ty: TypeId,
+    types: &TypeInterner,
+    values: &mut ValueInterner,
+    buf: &mut Vec<ValueId>,
+) -> ValueId {
+    match ty.as_primitive() {
+        Ok(PrimitiveType::U256) => values.intern(Value::BigNum(U256::ZERO)),
+        Ok(PrimitiveType::Bool) => values.intern(Value::Bool(false)),
+        Ok(PrimitiveType::Void) => values.intern(Value::Void),
+        Ok(PrimitiveType::Type) => values.intern(Value::Type(TypeId::VOID)),
+        Ok(PrimitiveType::MemoryPointer | PrimitiveType::Function | PrimitiveType::Never) => {
+            unreachable!("memptr/function/never cannot appear in comptime uninit struct")
+        }
+        Err(struct_ref) => {
+            let buf_offset = buf.len();
+            let view = types.lookup_struct(struct_ref);
+            for field in view.fields {
+                let vid = build_uninit_comptime(field.ty, types, values, buf);
+                buf.push(vid);
+            }
+            let result = values.intern(Value::StructVal { ty, fields: &buf[buf_offset..] });
+            buf.truncate(buf_offset);
+            result
+        }
+    }
+}
+
 fn as_u256(values: &ValueInterner, vid: ValueId) -> U256 {
     match values.lookup(vid) {
         Value::BigNum(n) => n,
-        other => unreachable!("expected U256 value, got {other:?}"),
+        other => unreachable!("invariant: type checked as u256, got {other:?}"),
     }
 }

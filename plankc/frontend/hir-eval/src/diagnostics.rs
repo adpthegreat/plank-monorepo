@@ -2,7 +2,7 @@ use alloy_primitives::U256;
 use plank_core::{Span, must_use::MustUseStrict};
 use plank_hir as hir;
 use plank_session::{Builtin, builtins::builtin_names, diagnostic::fmt_count, *};
-use plank_values::{TypeId, TypeInterner, builtins as builtin_sigs};
+use plank_values::{PrimitiveType, TypeId, TypeInterner, builtins as builtin_sigs};
 
 pub(crate) struct BindingLoc {
     pub r#use: SrcLoc,
@@ -643,5 +643,61 @@ impl DiagCtx<'_> {
         Diagnostic::error("infinite comptime recursion detected")
             .primary(call.source, call.span, "call that recurses with identical arguments")
             .emit(self.session);
+    }
+
+    fn uninit_help() -> String {
+        use builtin_names::*;
+        format!(
+            "{UNINIT} only supports {U256}, {BOOL}, {VOID}, {TYPE}, {MEMORY_POINTER} and struct types",
+        )
+    }
+
+    pub fn emit_invalid_uninit_type(&mut self, ty: PrimitiveType, loc: SrcLoc) {
+        Diagnostic::error("cannot create uninitialized value")
+            .primary(loc.source, loc.span, format!("type '{}' cannot be uninitialized", ty.name()))
+            .help(Self::uninit_help())
+            .emit(self);
+    }
+
+    pub fn emit_invalid_uninit_struct_field(
+        &mut self,
+        ty: PrimitiveType,
+        loc: SrcLoc,
+        field_loc: SrcLoc,
+    ) {
+        Diagnostic::error("struct contains field that cannot be uninitialized")
+            .primary(
+                loc.source,
+                loc.span,
+                format!("cannot use {} on this struct", builtin_names::UNINIT),
+            )
+            .element(
+                Annotations::new(field_loc.source).secondary(
+                    field_loc.span,
+                    format!("type '{}' cannot be uninitialized", ty.name()),
+                ),
+            )
+            .help(Self::uninit_help())
+            .emit(self);
+    }
+
+    pub fn emit_uninit_memptr_in_comptime(&mut self, loc: SrcLoc) {
+        Diagnostic::error(format!(
+            "cannot use {} on memptr type at comptime",
+            builtin_names::UNINIT
+        ))
+        .primary(loc.source, loc.span, "memptr requires runtime allocation")
+        .emit(self);
+    }
+
+    pub fn emit_never_as_struct_field(&mut self, field_def: SrcLoc, name: StrId) {
+        let name = self.session.lookup_name(name);
+        Diagnostic::error(format!("`{}` not valid struct field type", builtin_names::NEVER))
+            .primary(
+                field_def.source,
+                field_def.span,
+                format!("type of `{name}` evaluated to `{}`", builtin_names::NEVER),
+            )
+            .emit(self);
     }
 }
