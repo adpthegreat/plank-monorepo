@@ -20,6 +20,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         args: hir::CallArgsId,
         expr_span: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
+        let args = &self.eval.hir.call_args[args];
         match builtin {
             Builtin::Runtime(runtime) => {
                 if runtime.foldable() {
@@ -40,17 +41,16 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         }
     }
 
-    fn eval_runtime_foldable_builtin(
+    pub fn eval_runtime_foldable_builtin(
         &mut self,
         builtin: RuntimeBuiltin,
-        args: hir::CallArgsId,
+        args: &[hir::LocalId],
         expr_span: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
         let result_type = self.resolve_runtime_builtin_result_type(builtin, args, expr_span)?;
 
-        let hir_args = &self.hir.call_args[args];
         let folded = self.with_values_buf(|this, values_buf_offset| {
-            for &arg in hir_args {
+            for &arg in args {
                 let (state, _arg_use_span, arg_origin) =
                     this.bindings[arg].poisoned().expect("invariant: arg type check checks poison");
                 match state {
@@ -65,11 +65,23 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     LocalState::Runtime(_) => return Ok(None),
                 }
             }
-            Ok(Some(fold_runtime_builtin(
+            let result = fold_runtime_builtin(
                 builtin,
                 &this.eval.values_buf[values_buf_offset..],
                 this.eval.values,
-            )))
+            );
+            Ok(Some(match result_type {
+                TypeId::U256 => this.eval.values.intern_num(result),
+                TypeId::BOOL => match result {
+                    U256::ZERO => ValueId::FALSE,
+                    U256::ONE => ValueId::TRUE,
+                    x => unreachable!("{x} can't be turned into `bool`"),
+                },
+                ty => unreachable!(
+                    "unsupported result type `{}`",
+                    this.eval.types.format(this.diag_ctx.session, ty)
+                ),
+            }))
         })?;
         if let Some(value) = folded {
             return Ok(Ok(EvalValue::Comptime(value)));
@@ -81,7 +93,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn eval_runtime_only_builtin(
         &mut self,
         builtin: RuntimeBuiltin,
-        args: hir::CallArgsId,
+        args: &[hir::LocalId],
         expr_span: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
         let result_type = self.resolve_runtime_builtin_result_type(builtin, args, expr_span)?;
@@ -101,13 +113,12 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn resolve_runtime_builtin_result_type(
         &mut self,
         builtin: RuntimeBuiltin,
-        args: hir::CallArgsId,
+        args: &[hir::LocalId],
         expr_span: SourceSpan,
     ) -> MaybePoisoned<TypeId> {
-        let hir_args = &self.hir.call_args[args];
         let expr_loc = self.loc(expr_span);
         self.with_types_buf(|this, types_buf_offset| {
-            for &arg in hir_args {
+            for &arg in args {
                 let ty = this.state_type(this.bindings[arg].state?);
                 this.eval.types_buf.push(ty);
             }
@@ -127,12 +138,11 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn emit_runtime_builtin_mir(
         &mut self,
         builtin: RuntimeBuiltin,
-        args: hir::CallArgsId,
+        args: &[hir::LocalId],
         result_type: TypeId,
     ) -> Result<EvalValue, Diverge> {
-        let hir_args = &self.hir.call_args[args];
         let mir_args = self.with_locals_buf(|this, locals_buf_offset| {
-            for &arg in hir_args {
+            for &arg in args {
                 let state =
                     this.bindings[arg].state.expect("invariant: arg type check checks poison");
                 if let LocalState::Comptime(vid) = state {
@@ -162,31 +172,31 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn eval_comptime_builtin(
         &mut self,
         builtin: Builtin,
-        args: hir::CallArgsId,
+        args: &[hir::LocalId],
         expr_span: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
-        let hir_args = &self.hir.call_args[args];
         let expr_loc = self.loc(expr_span);
 
-        if builtin_sigs::arg_count(builtin) != hir_args.len() {
-            self.diag_ctx.emit_wrong_arg_count(builtin, hir_args.len(), expr_loc);
+        if builtin_sigs::arg_count(builtin) != args.len() {
+            self.diag_ctx.emit_wrong_arg_count(builtin, args.len(), expr_loc);
             return Err(Poisoned);
         }
 
         match builtin {
             Builtin::IsStruct => {
-                let &[ty_local] = hir_args else { unreachable!("arg count checked") };
+                let &[ty_local] = args else { unreachable!("arg count checked") };
                 let ty = self.expect_type_arg(ty_local, builtin, expr_span)?;
                 let is_struct = !ty.is_primitive();
                 Ok(Ok(EvalValue::Comptime(is_struct.into())))
             }
             Builtin::FieldCount => {
-                let &[r#struct] = hir_args else { unreachable!("arg count checked") };
+                let &[r#struct] = args else { unreachable!("arg count checked") };
                 let ty = self.expect_type_arg(r#struct, builtin, expr_span)?;
                 let r#struct = self.expect_struct_type(ty, builtin, expr_span)?;
                 let count = U256::from(r#struct.fields.len());
                 Ok(Ok(EvalValue::Comptime(self.eval.values.intern_num(count))))
             }
+            Builtin::InComptime => Ok(Ok(EvalValue::Comptime(self.comptime.into()))),
             _ => unreachable!("not a comptime builtin: {builtin}"),
         }
     }
@@ -194,22 +204,19 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn eval_comptime_dynamic_builtin(
         &mut self,
         builtin: Builtin,
-        args: hir::CallArgsId,
-        expr_span: SourceSpan,
+        args: &[hir::LocalId],
+        expr: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
-        let hir_args = &self.hir.call_args[args];
-        let expr_loc = self.loc(expr_span);
-
-        if builtin_sigs::arg_count(builtin) != hir_args.len() {
-            self.diag_ctx.emit_wrong_arg_count(builtin, hir_args.len(), expr_loc);
+        if builtin_sigs::arg_count(builtin) != args.len() {
+            self.diag_ctx.emit_wrong_arg_count(builtin, args.len(), self.loc(expr));
             return Err(Poisoned);
         }
 
         match builtin {
-            Builtin::FieldType => self.eval_field_type(hir_args, builtin, expr_span),
-            Builtin::GetField => self.eval_get_field(hir_args, builtin, expr_span),
-            Builtin::SetField => self.eval_set_field(hir_args, builtin, expr_span),
-            Builtin::Uninit => self.eval_uninit(hir_args, builtin, expr_span),
+            Builtin::FieldType => self.eval_field_type(args, builtin, expr),
+            Builtin::GetField => self.eval_get_field(args, builtin, expr),
+            Builtin::SetField => self.eval_set_field(args, builtin, expr),
+            Builtin::Uninit => self.eval_uninit(args, builtin, expr),
             _ => unreachable!("not a comptime dynamic builtin: {builtin}"),
         }
     }
@@ -509,7 +516,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         }
     }
 
-    fn materialize_as_local(&mut self, state: LocalState, ty: TypeId) -> mir::LocalId {
+    pub(crate) fn materialize_as_local(&mut self, state: LocalState, ty: TypeId) -> mir::LocalId {
         match state {
             LocalState::Runtime(local) => local,
             LocalState::Comptime(vid) => {
@@ -521,17 +528,18 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     }
 }
 
-fn fold_runtime_builtin(
+pub(crate) fn fold_runtime_builtin(
     builtin: RuntimeBuiltin,
     args: &[ValueId],
     values: &mut ValueInterner,
-) -> ValueId {
+) -> U256 {
+    use plank_evm as evm;
     match *args {
         [a] => {
             let a = as_u256(values, a);
             match builtin {
-                RuntimeBuiltin::IsZero => plank_evm::iszero(a).into(),
-                RuntimeBuiltin::Not => values.intern_num(plank_evm::not(a)),
+                RuntimeBuiltin::IsZero => U256::from(plank_evm::iszero(a)),
+                RuntimeBuiltin::Not => plank_evm::not(a),
                 _ => unreachable!("not a unary foldable builtin: {builtin}"),
             }
         }
@@ -539,27 +547,27 @@ fn fold_runtime_builtin(
             let a = as_u256(values, a);
             let b = as_u256(values, b);
             match builtin {
-                RuntimeBuiltin::Add => values.intern_num(plank_evm::add(a, b)),
-                RuntimeBuiltin::Mul => values.intern_num(plank_evm::mul(a, b)),
-                RuntimeBuiltin::Sub => values.intern_num(plank_evm::sub(a, b)),
-                RuntimeBuiltin::Div => values.intern_num(plank_evm::div(a, b)),
-                RuntimeBuiltin::SDiv => values.intern_num(plank_evm::sdiv(a, b)),
-                RuntimeBuiltin::Mod => values.intern_num(plank_evm::r#mod(a, b)),
-                RuntimeBuiltin::SMod => values.intern_num(plank_evm::smod(a, b)),
-                RuntimeBuiltin::Exp => values.intern_num(plank_evm::exp(a, b)),
-                RuntimeBuiltin::SignExtend => values.intern_num(plank_evm::signextend(a, b)),
-                RuntimeBuiltin::Lt => plank_evm::lt(a, b).into(),
-                RuntimeBuiltin::Gt => plank_evm::gt(a, b).into(),
-                RuntimeBuiltin::SLt => plank_evm::slt(a, b).into(),
-                RuntimeBuiltin::SGt => plank_evm::sgt(a, b).into(),
-                RuntimeBuiltin::Eq => plank_evm::eq(a, b).into(),
-                RuntimeBuiltin::And => values.intern_num(plank_evm::and(a, b)),
-                RuntimeBuiltin::Or => values.intern_num(plank_evm::or(a, b)),
-                RuntimeBuiltin::Xor => values.intern_num(plank_evm::xor(a, b)),
-                RuntimeBuiltin::Byte => values.intern_num(plank_evm::byte(a, b)),
-                RuntimeBuiltin::Shl => values.intern_num(plank_evm::shl(a, b)),
-                RuntimeBuiltin::Shr => values.intern_num(plank_evm::shr(a, b)),
-                RuntimeBuiltin::Sar => values.intern_num(plank_evm::sar(a, b)),
+                RuntimeBuiltin::Add => evm::add(a, b),
+                RuntimeBuiltin::Mul => evm::mul(a, b),
+                RuntimeBuiltin::Sub => evm::sub(a, b),
+                RuntimeBuiltin::Div => evm::div(a, b),
+                RuntimeBuiltin::SDiv => evm::sdiv(a, b),
+                RuntimeBuiltin::Mod => evm::r#mod(a, b),
+                RuntimeBuiltin::SMod => evm::smod(a, b),
+                RuntimeBuiltin::Exp => evm::exp(a, b),
+                RuntimeBuiltin::SignExtend => evm::signextend(a, b),
+                RuntimeBuiltin::Lt => U256::from(evm::lt(a, b)),
+                RuntimeBuiltin::Gt => U256::from(evm::gt(a, b)),
+                RuntimeBuiltin::SLt => U256::from(evm::slt(a, b)),
+                RuntimeBuiltin::SGt => U256::from(evm::sgt(a, b)),
+                RuntimeBuiltin::Eq => U256::from(evm::eq(a, b)),
+                RuntimeBuiltin::And => evm::and(a, b),
+                RuntimeBuiltin::Or => evm::or(a, b),
+                RuntimeBuiltin::Xor => evm::xor(a, b),
+                RuntimeBuiltin::Byte => evm::byte(a, b),
+                RuntimeBuiltin::Shl => evm::shl(a, b),
+                RuntimeBuiltin::Shr => evm::shr(a, b),
+                RuntimeBuiltin::Sar => evm::sar(a, b),
                 _ => unreachable!("not a binary foldable builtin: {builtin}"),
             }
         }
@@ -568,8 +576,8 @@ fn fold_runtime_builtin(
             let b = as_u256(values, b);
             let c = as_u256(values, c);
             match builtin {
-                RuntimeBuiltin::AddMod => values.intern_num(plank_evm::addmod(a, b, c)),
-                RuntimeBuiltin::MulMod => values.intern_num(plank_evm::mulmod(a, b, c)),
+                RuntimeBuiltin::AddMod => plank_evm::addmod(a, b, c),
+                RuntimeBuiltin::MulMod => plank_evm::mulmod(a, b, c),
                 _ => unreachable!("not a ternary foldable builtin: {builtin}"),
             }
         }
@@ -653,9 +661,16 @@ fn build_uninit_comptime(
     }
 }
 
-fn as_u256(values: &ValueInterner, vid: ValueId) -> U256 {
+pub(crate) fn as_u256(values: &ValueInterner, vid: ValueId) -> U256 {
     match values.lookup(vid) {
         Value::BigNum(n) => n,
+        Value::Bool(b) => {
+            if b {
+                U256::ONE
+            } else {
+                U256::ZERO
+            }
+        }
         other => unreachable!("invariant: type checked as u256, got {other:?}"),
     }
 }
