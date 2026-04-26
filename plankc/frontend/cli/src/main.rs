@@ -58,6 +58,15 @@ struct BuildArgs {
     #[arg(short = 'm', long = "show-mir", help = "show MIR")]
     show_mir: bool,
 
+    #[arg(
+        long = "show-sir-first",
+        help = "show the SIR going into the middle end (directly after lowering from MIR)"
+    )]
+    show_sir_in: bool,
+
+    #[arg(long = "show-sir-final", help = "show the final SIR pre lowering to EVM assembly")]
+    show_sir_last: bool,
+
     #[arg(short = 'O', long = "optimize", help = OPTIMIZE_HELP, value_parser = parse_optimizations_string)]
     optimize: Option<String>,
 
@@ -186,32 +195,44 @@ fn build(plank_dir: Option<PathBuf>, args: BuildArgs) {
 
     let hir = driver.lower_hir(&project);
 
+    let needs_separators = (args.show_hir as u32)
+        + (args.show_mir as u32)
+        + (args.show_sir_in as u32)
+        + (args.show_sir_last as u32)
+        >= 2;
+
     if args.show_hir {
-        if args.show_mir {
-            println!("////////////////////////////////////////////////////////////////");
-            println!("//                            HIR                             //");
-            println!("////////////////////////////////////////////////////////////////");
+        if needs_separators {
+            eprintln!("////////////////////////////////////////////////////////////////");
+            eprintln!("//                            HIR                             //");
+            eprintln!("////////////////////////////////////////////////////////////////");
         }
-        print!("{}", DisplayHir::new(&hir, &driver.values, &driver.session));
-        if args.show_mir {
-            println!("\n");
-            println!("////////////////////////////////////////////////////////////////");
-            println!("//                            MIR                             //");
-            println!("////////////////////////////////////////////////////////////////");
-        }
+        eprintln!("{}", DisplayHir::new(&hir, &driver.values, &driver.session));
     }
 
     let mir = driver.evaluate_hir(&hir, project.core_ops_source);
 
     if args.show_mir {
-        print!("{}", DisplayMir::new(&mir, &driver.values, &driver.session));
+        if needs_separators {
+            eprintln!("\n");
+            eprintln!("////////////////////////////////////////////////////////////////");
+            eprintln!("//                            MIR                             //");
+            eprintln!("////////////////////////////////////////////////////////////////");
+        }
+        eprintln!("{}", DisplayMir::new(&mir, &driver.values, &driver.session));
     }
 
     if driver.session.has_errors() {
         driver.render_diagnostics_and_exit();
     }
 
-    let bytecode = driver.emit_bytecode(&mir, args.optimize.as_deref());
+    let bytecode = driver.emit_bytecode(
+        &mir,
+        args.optimize.as_deref(),
+        needs_separators,
+        args.show_sir_in,
+        args.show_sir_last,
+    );
 
     print!("0x");
     for byte in bytecode {
