@@ -1,0 +1,94 @@
+import std::storage::map_slot_hash;
+import std::constructor::return_runtime;
+
+const CLAIM_SELECTOR = 0x3d13f874;
+const MERKLE_ROOT_SELECTOR = 0x2eb4a7ab;
+const HAS_CLAIMED_SELECTOR = 0x73b2e80e;
+
+const CLAIMED_TOPIC = 0xd8138f8a3f377c5259ca548e70e4c2de94f129f5a11036a15b69513cba2b426a;
+
+const MERKLE_ROOT_SLOT = 0;
+const HAS_CLAIMED_SLOT_BASE = 1;
+
+init {
+    let args_buf = @malloc_zeroed(32);
+    @evm_codecopy(args_buf, @init_end_offset(), 32);
+    let merkle_root = @mload32(args_buf);
+    @evm_sstore(MERKLE_ROOT_SLOT, merkle_root);
+
+    return_runtime();
+}
+
+run {
+    let selector = @evm_calldataload(0) >> 224;
+    if selector == CLAIM_SELECTOR {
+        claim();
+    } else if selector == MERKLE_ROOT_SELECTOR {
+        merkle_root();
+    } else if selector == HAS_CLAIMED_SELECTOR {
+        has_claimed();
+    } else {
+        @evm_revert(@malloc_uninit(0), 0);
+    }
+}
+
+const claim = fn () never {
+    let buf = @malloc_uninit(64);
+    let slot = get_merkle_slot();
+    let claimed = @evm_sload(slot);
+    if claimed != 0 {
+        @evm_revert(@malloc_uninit(0), 0);
+    }
+
+    let address = @evm_calldataload(4);
+    let amount = @evm_calldataload(36);
+    let offset = 4 + @evm_calldataload(68);
+    let proof_length = @evm_calldataload(offset);
+
+    @mstore20(buf, address);
+    @mstore32(@evm_add(buf, 20), amount);
+    let mut node = @evm_keccak256(buf, 52);
+
+    let mut i = 0;
+    while i < proof_length {
+        let proof_element = @evm_calldataload(offset + 32 + i * 32);
+        if node <= proof_element {
+            @mstore32(buf, node);
+            @mstore32(@evm_add(buf, 32), proof_element);
+        } else {
+            @mstore32(buf, proof_element);
+            @mstore32(@evm_add(buf, 32), node);
+        }
+        node = @evm_keccak256(buf, 64);
+        i = i + 1;
+    }
+
+    let root = @evm_sload(MERKLE_ROOT_SLOT);
+    if node != root {
+        @evm_revert(@malloc_uninit(0), 0);
+    }
+
+    @evm_sstore(slot, 1);
+    @mstore32(buf, amount);
+    @evm_log2(buf, 32, CLAIMED_TOPIC, address);
+    @evm_return(@malloc_uninit(0), 0);
+};
+
+const merkle_root = fn () never {
+    let buf = @malloc_uninit(32);
+    @mstore32(buf, @evm_sload(MERKLE_ROOT_SLOT));
+    @evm_return(buf, 32);
+};
+
+const has_claimed = fn () never {
+    let buf = @malloc_uninit(64);
+    let slot = get_merkle_slot();
+    let claimed = @evm_sload(slot);
+    @mstore32(buf, claimed);
+    @evm_return(buf, 32);
+};
+
+const get_merkle_slot = fn () u256 {
+    let address = @evm_calldataload(4);
+    map_slot_hash(address, HAS_CLAIMED_SLOT_BASE)
+};

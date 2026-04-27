@@ -138,12 +138,9 @@ impl AsmSection {
                 let value = match mark_ref.mark_ref {
                     MarkReference::Direct(id) => mark_map[id],
                     MarkReference::Delta(span) => {
-                        let start_offset = mark_map[span.start];
-                        let end_offset = mark_map[span.end];
-                        // `end_offset` can be less than `start_offset` if while converging we
-                        // update the start offset *before* end, potentially bumping it to a higher
-                        // value.
-                        end_offset.saturating_sub(start_offset)
+                        // The end mark may temporarily have an offset smaller than the start's if
+                        // the start is updated *first* to a large value past end.
+                        mark_map[span.end].saturating_sub(mark_map[span.start])
                     }
                 };
                 let ref_size = bytes_to_hold(value);
@@ -322,7 +319,6 @@ impl Assembler {
         self.sections.push(section);
     }
 
-    // Helpful for debugging but not always used.
     #[allow(unused)]
     fn eprint_mark_map(mark_to_offset: &IndexVec<MarkId, u32>) {
         eprint!("{{");
@@ -398,7 +394,9 @@ impl Assembler {
                     let value = match mark_ref.mark_ref {
                         MarkReference::Direct(id) => mark_to_offset[id],
                         MarkReference::Delta(span) => {
-                            mark_to_offset[span.end] - mark_to_offset[span.start]
+                            mark_to_offset[span.end]
+                                .checked_sub(mark_to_offset[span.start])
+                                .expect("delta underflow after convergence: marks did not settle into valid positions")
                         }
                     };
                     if value == 0 && mark_ref.set_size.is_none() && mark_ref.pushed {

@@ -1,0 +1,14 @@
+import std::abi::{abi_encode, abi_decode};
+import std::membytes::{membytes, membytes_from_ptr};
+
+const Pair = struct { a: u256, b: u256 };
+
+init {
+    let size = @evm_calldatasize();
+    let ptr = @malloc_zeroed(size);
+    @evm_calldatacopy(ptr, 0, size);
+    let input = membytes_from_ptr(ptr, size);
+    let decoded = abi_decode(Pair, input);
+    let encoded = abi_encode(Pair, decoded);
+    @evm_return(encoded.ptr, encoded.len);
+}
