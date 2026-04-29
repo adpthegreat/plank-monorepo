@@ -20,3 +20,15 @@ tendency to write things that look right but aren't.
 
 Slop PRs will have your issue instantly closed and have you potentially banned.
 
+## "Good First Issue"
+
+Issues marked "good first issue" are intended to help foster a community of
+external contributors who bring value to the project and are generally
+purposefully easier/broken down tasks to lower the barrier to entry.
+
+It is largely **forbidden** to use LLMs / Agentic Workflows to complete these.
+They are likely oneshottable anyway, their purpose is however to give new devs a
+low barrier to entry and give a gentle introduction to the codebase.
+
+Once you are a seasoned contributor / working on more intricate you *may* use AI
+in accordance with the above guidelines.
