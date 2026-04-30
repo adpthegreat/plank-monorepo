@@ -5,6 +5,7 @@ pub mod transforms;
 use optimizations::{
     constant_propagation::SCCP, copy_propagation::CopyPropagation,
     unused_operation_elimination::UnusedOperationElimination,
+    switch_lowering::SwitchLowering
 };
 use sir_data::EthIRProgram;
 
@@ -38,6 +39,7 @@ pub struct PassManager<'a> {
     copy_prop: Option<CopyPropagation>,
     unused_elim: Option<UnusedOperationElimination>,
     defragmenter: Option<Defragmenter>,
+    switch_lowering: Option<SwitchLowering>
 }
 
 impl<'a> PassManager<'a> {
@@ -50,6 +52,7 @@ impl<'a> PassManager<'a> {
             copy_prop: None,
             unused_elim: None,
             defragmenter: None,
+            switch_lowering: None
         }
     }
 
@@ -77,6 +80,9 @@ impl<'a> PassManager<'a> {
                 }
                 OptimizationPass::Defragment => {
                     run_pass(self.defragmenter.get_or_insert_default(), self.program, &self.store)
+                }
+                OptimizationPass::SwitchLowering => {
+                    run_pass(self.switch_lowering.get_or_insert_default(), self.program, &self.store)
                 }
             }
         }
