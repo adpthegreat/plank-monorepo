@@ -1,5 +1,4 @@
 use crate::{AnalysesStore, Pass};
-use plank_core::Idx;
 use sir_data::{Branch, Control, EthIRProgram, Switch};
 
 #[derive(Default)]
@@ -12,9 +11,15 @@ impl Pass for SwitchLowering {
                 Control::Switch(Switch { cases, fallback, condition }) => {
                     if let Some(fallback) = fallback {
                         let cases_data = program.cases[cases];
-                        if cases_data.target_indices().len() == 1 {
-                            let target_idx = cases_data.target_indices().iter().next().expect("index should not be empty");
-                            let target = program.cases_bb_ids[target_idx];
+                        if cases_data.cases_count == 1 {
+                            let (case_value, target) = cases_data
+                                .iter(program)
+                                .next()
+                                .expect("single-case switch should have a case");
+                            if !case_value.is_zero() {
+                                continue;
+                            }
+
                             program.basic_blocks[bb].control = Control::Branches(Branch {
                                 condition,
                                 non_zero_target: fallback,
@@ -29,17 +34,15 @@ impl Pass for SwitchLowering {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_pass;
-    use sir_parser::EmitConfig;
+    use crate::run_pass_and_display;
+    use sir_test_utils::assert_trim_strings_eq_with_diff;
 
     #[test]
-    fn test_switch_lowering() {
-        let mut program = sir_parser::parse_or_panic(
-            r#"
+    fn lowers_zero_case_with_default_to_branch() {
+        let input = r#"
             fn init:
                 a {
                     sel = const 0
@@ -54,25 +57,83 @@ mod tests {
                 c {
                     stop
                 }
-            "#,
-            EmitConfig::init_only(),
-        );
+        "#;
 
-        let store = AnalysesStore::default();
-        run_pass(&mut SwitchLowering, &mut program, &store);
+        let expected = r#"
+Init: @0
+Functions:
+    fn @0 -> entry @0  (outputs: 0)
 
-        for (bbi, bb) in program.basic_blocks.iter().enumerate() {
-            match &bb.control {
-                Control::Branches(Branch { non_zero_target, zero_target, .. }) => {
-                    assert!(
-                        non_zero_target.get() != zero_target.get(),
-                        "Block {} has branch targets",
-                        bbi
-                    );
+Basic Blocks:
+    @0 {
+        $0 = const 0x0
+        => $0 ? @2 : @1
+    }
+
+    @1 {
+        => @2
+    }
+
+    @2 {
+        stop
+    }
+        "#;
+
+        let actual = run_pass_and_display::<SwitchLowering>(input);
+        assert_trim_strings_eq_with_diff(&actual, expected, "switch lowering zero case");
+    }
+
+    #[test]
+    fn does_not_lower_non_zero_case_with_default() {
+        let input = r#"
+            fn init:
+                a {
+                    sel = const 0
+                    switch sel {
+                        1 => @c
+                        default => @d
+                    }
                 }
-                _ => {}
-            }
+                b {
+                    => @c
+                }
+                c {
+                    stop
+                }
+                d {
+                    stop
+                }
+        "#;
+
+        let expected = r#"
+Init: @0
+Functions:
+    fn @0 -> entry @0  (outputs: 0)
+
+Basic Blocks:
+    @0 {
+        $0 = const 0x0
+        switch $0 {
+            0x1 => @2,
+            else => @3
         }
+
+    }
+
+    @1 {
+        => @2
+    }
+
+    @2 {
+        stop
+    }
+
+    @3 {
+        stop
+    }
+        "#;
+
+        let actual = run_pass_and_display::<SwitchLowering>(input);
+        assert_trim_strings_eq_with_diff(&actual, expected, "switch lowering non-zero case");
     }
 }
-
