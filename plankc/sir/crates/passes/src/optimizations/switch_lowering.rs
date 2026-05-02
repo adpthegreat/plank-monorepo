@@ -7,28 +7,27 @@ pub struct SwitchLowering;
 impl Pass for SwitchLowering {
     fn run(&mut self, program: &mut EthIRProgram, _store: &AnalysesStore) {
         for bb in program.basic_blocks.iter_idx() {
-            match program.basic_blocks[bb].control {
-                Control::Switch(Switch { cases, fallback, condition }) => {
-                    if let Some(fallback) = fallback {
-                        let cases_data = program.cases[cases];
-                        if cases_data.cases_count == 1 {
-                            let (case_value, target) = cases_data
-                                .iter(program)
-                                .next()
-                                .expect("single-case switch should have a case");
-                            if !case_value.is_zero() {
-                                continue;
-                            }
-
-                            program.basic_blocks[bb].control = Control::Branches(Branch {
-                                condition,
-                                non_zero_target: fallback,
-                                zero_target: target,
-                            });
+            if let Control::Switch(Switch { cases, fallback, condition }) =
+                program.basic_blocks[bb].control
+            {
+                if let Some(fallback) = fallback {
+                    let cases_data = program.cases[cases];
+                    if cases_data.cases_count == 1 {
+                        let (case_value, target) = cases_data
+                            .iter(program)
+                            .next()
+                            .expect("single-case switch should have a case");
+                        if !case_value.is_zero() {
+                            continue;
                         }
+
+                        program.basic_blocks[bb].control = Control::Branches(Branch {
+                            condition,
+                            non_zero_target: fallback,
+                            zero_target: target,
+                        });
                     }
                 }
-                _ => {}
             }
         }
     }
