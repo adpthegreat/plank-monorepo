@@ -1,8 +1,8 @@
 pub(crate) mod constant_propagation;
 pub(crate) mod copy_propagation;
 pub(crate) mod defragmenter;
-pub(crate) mod unused_operation_elimination;
 pub(crate) mod switch_lowering;
+pub(crate) mod unused_operation_elimination;
 
 pub use defragmenter::Defragmenter;
 
@@ -12,7 +12,7 @@ pub enum OptimizationPass {
     CopyPropagation,
     UnusedElimination,
     Defragment,
-    SwitchLowering
+    SwitchLowering,
 }
 
 impl OptimizationPass {
