@@ -3,7 +3,7 @@ pub mod optimizations;
 pub mod transforms;
 
 use optimizations::{
-    constant_propagation::SCCP, copy_propagation::CopyPropagation,
+    constant_propagation::SCCP, copy_propagation::CopyPropagation, switch_peephole::SwitchPeephole,
     unused_operation_elimination::UnusedOperationElimination,
 };
 use sir_data::EthIRProgram;
@@ -38,6 +38,7 @@ pub struct PassManager<'a> {
     copy_prop: Option<CopyPropagation>,
     unused_elim: Option<UnusedOperationElimination>,
     defragmenter: Option<Defragmenter>,
+    switch_peephole: Option<SwitchPeephole>,
 }
 
 impl<'a> PassManager<'a> {
@@ -50,6 +51,7 @@ impl<'a> PassManager<'a> {
             copy_prop: None,
             unused_elim: None,
             defragmenter: None,
+            switch_peephole: None,
         }
     }
 
@@ -78,6 +80,11 @@ impl<'a> PassManager<'a> {
                 OptimizationPass::Defragment => {
                     run_pass(self.defragmenter.get_or_insert_default(), self.program, &self.store)
                 }
+                OptimizationPass::SwitchPeephole => run_pass(
+                    self.switch_peephole.get_or_insert_default(),
+                    self.program,
+                    &self.store,
+                ),
             }
         }
         debug_assert!(self.run_legalize().is_ok(), "optimized IR is illegal");

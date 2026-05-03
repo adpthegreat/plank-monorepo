@@ -1,6 +1,7 @@
 pub(crate) mod constant_propagation;
 pub(crate) mod copy_propagation;
 pub(crate) mod defragmenter;
+pub(crate) mod switch_peephole;
 pub(crate) mod unused_operation_elimination;
 
 pub use defragmenter::Defragmenter;
@@ -11,6 +12,7 @@ pub enum OptimizationPass {
     CopyPropagation,
     UnusedElimination,
     Defragment,
+    SwitchPeephole,
 }
 
 impl OptimizationPass {
@@ -20,6 +22,7 @@ impl OptimizationPass {
             'c' => Some(Self::CopyPropagation),
             'u' => Some(Self::UnusedElimination),
             'd' => Some(Self::Defragment),
+            'l' => Some(Self::SwitchPeephole),
             _ => None,
         }
     }
@@ -30,6 +33,7 @@ pub const OPTIMIZE_HELP: &str = "Optimization passes to run in order. Each chara
     c = copy propagation,\n\
     u = unused operation elimination,\n\
     d = defragment.\n\
+    l = switch peephole \n\
     Example: -O csud";
 
 pub fn parse_optimizations_string(s: &str) -> Result<String, String> {
